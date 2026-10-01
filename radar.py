@@ -622,7 +622,7 @@ def send_status(chat_id):
         f"Durum: {state}\n"
         f"Çalışma süresi: {uptime_text()}\n\n"
         f"Minimum skor: {MIN_SCORE}/100\n"
-        f"Hedef coin sayısı: {TOP}\n"
+        f"Tarama kapsamı: Tüm aktif USDT Perpetual\n"
         f"Tarama aralığı: {INTERVAL} sn\n\n"
         f"Son tarama: {last_text}\n"
         f"Son tarama süresi: {duration_text}\n"
