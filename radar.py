@@ -94,6 +94,7 @@ def telegram(msg):
 
 def run():
     print('Coin Radar v1 started')
+    telegram('🟢 COIN RADAR AKTİF - Telegram bağlantısı çalışıyor!')
     while True:
       try:
         for sym in symbols():
