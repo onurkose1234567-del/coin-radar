@@ -94,10 +94,12 @@ def telegram(msg):
 
 def run():
     print('Coin Radar v1 started')
-    telegram('🟢 COIN RADAR AKTİF - Telegram bağlantısı çalışıyor!')
-    while True:
+    telegram('🟢 COIN RADAR AKTİF - Telegram bağlantısı while True:
       try:
-        for sym in symbols():
+        coin_list = symbols()
+        print(f'🔎 Tarama başladı - {len(coin_list)} coin kontrol ediliyor...', flush=True)
+
+        for sym in coin_list:
           try:
             for sc,dr,p,sl,t1,t2,rs,rv,vr,ax in analyze(sym):
               key=(sym,dr); now=time.time()
