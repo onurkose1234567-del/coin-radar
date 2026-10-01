@@ -29,7 +29,7 @@ MIN_SCORE = float(os.getenv("MIN_SCORE", "80"))
 MIN_TECH_SCORE = float(os.getenv("MIN_TECH_SCORE", "72"))
 
 # Binance Futures minimum 24 saatlik quote hacmi
-MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000000"))
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "5000000"))
 
 # Tarama aralığı
 SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
