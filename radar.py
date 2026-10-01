@@ -14,7 +14,7 @@ load_dotenv()
 
 BASE = "https://fapi.binance.com"
 
-MIN_SCORE = float(os.getenv("MIN_SCORE", "90"))
+MIN_SCORE = float(os.getenv("MIN_SCORE", "85"))
 MIN_VOLUME = 10_000_000          # Minimum 24h Futures hacmi
 INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
 
