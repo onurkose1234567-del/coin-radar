@@ -15,7 +15,12 @@ load_dotenv()
 BASE = "https://fapi.binance.com"
 
 MIN_SCORE = float(os.getenv("MIN_SCORE", "90"))
+MIN_VOLUME = 10_000_000          # Minimum 24h Futures hacmi
 INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
+
+MAX_SL_PERCENT = 2.0             # SL maksimum %2
+MIN_TP1_RR = 1.0                 # TP1 en az 1R
+MIN_TP2_RR = 2.0                 # TP2 en az 2R
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -25,6 +30,7 @@ ALERT_COOLDOWN = 3600
 last_alert = {}
 
 bot_started = time.time()
+
 last_scan_time = None
 last_scan_duration = None
 last_scan_count = 0
@@ -41,10 +47,11 @@ telegram_offset = 0
 # =========================================================
 
 def get(path, params=None):
+
     r = requests.get(
         BASE + path,
         params=params,
-        timeout=15
+        timeout=20
     )
 
     r.raise_for_status()
@@ -53,13 +60,17 @@ def get(path, params=None):
 
 
 # =========================================================
-# TUM AKTIF USDT PERPETUAL COINLER
+# COIN LISTESI
+# SADECE 24H HACMI 10M+ OLANLAR
 # =========================================================
 
 def symbols():
+
     info = get("/fapi/v1/exchangeInfo")
 
-    result = []
+    tickers = get("/fapi/v1/ticker/24hr")
+
+    active = set()
 
     for x in info["symbols"]:
 
@@ -68,87 +79,118 @@ def symbols():
             and x.get("contractType") == "PERPETUAL"
             and x.get("status") == "TRADING"
         ):
-            result.append(x["symbol"])
+            active.add(x["symbol"])
+
+    result = []
+
+    for ticker in tickers:
+
+        sym = ticker.get("symbol")
+
+        if sym not in active:
+            continue
+
+        try:
+            volume = float(
+                ticker.get("quoteVolume", 0)
+            )
+        except:
+            volume = 0
+
+        if volume >= MIN_VOLUME:
+
+            result.append(
+                (
+                    sym,
+                    volume
+                )
+            )
+
+    result.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
 
     return result
 
 
 # =========================================================
-# MUMLAR
+# KLINE
 # =========================================================
 
-def klines(sym, interval, limit=220):
+def klines(symbol, interval, limit=220):
 
     data = get(
         "/fapi/v1/klines",
         {
-            "symbol": sym,
+            "symbol": symbol,
             "interval": interval,
             "limit": limit
         }
     )
 
-    d = pd.DataFrame(
+    df = pd.DataFrame(
         data,
         columns=[
-            "t",
-            "o",
-            "h",
-            "l",
-            "c",
-            "v",
-            "T",
-            "q",
-            "n",
-            "tb",
-            "tq",
-            "x"
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            "close_time",
+            "quote_volume",
+            "trades",
+            "taker_buy",
+            "taker_quote",
+            "ignore"
         ]
     )
 
-    for col in [
-        "o",
-        "h",
-        "l",
-        "c",
-        "v",
-        "q",
-        "tb"
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "quote_volume",
+        "taker_buy"
     ]:
-        d[col] = pd.to_numeric(
-            d[col],
+
+        df[column] = pd.to_numeric(
+            df[column],
             errors="coerce"
         )
 
-    return d
+    return df
 
 
 # =========================================================
 # RSI
 # =========================================================
 
-def rsi(s, n=14):
+def calculate_rsi(close, period=14):
 
-    delta = s.diff()
+    delta = close.diff()
 
-    up = delta.clip(lower=0)
+    gain = delta.clip(lower=0)
 
-    down = -delta.clip(upper=0)
+    loss = -delta.clip(upper=0)
 
-    avg_up = up.ewm(
-        alpha=1 / n,
+    avg_gain = gain.ewm(
+        alpha=1 / period,
         adjust=False
     ).mean()
 
-    avg_down = down.ewm(
-        alpha=1 / n,
+    avg_loss = loss.ewm(
+        alpha=1 / period,
         adjust=False
     ).mean()
 
     rs = (
-        avg_up
+        avg_gain
         /
-        avg_down.replace(0, np.nan)
+        avg_loss.replace(0, np.nan)
     )
 
     return 100 - (
@@ -160,21 +202,27 @@ def rsi(s, n=14):
 # ATR
 # =========================================================
 
-def atr(d, n=14):
+def calculate_atr(df, period=14):
 
-    previous_close = d.c.shift()
+    high = df["high"]
+
+    low = df["low"]
+
+    close = df["close"]
+
+    previous_close = close.shift(1)
 
     tr = pd.concat(
         [
-            d.h - d.l,
-            (d.h - previous_close).abs(),
-            (d.l - previous_close).abs()
+            high - low,
+            (high - previous_close).abs(),
+            (low - previous_close).abs()
         ],
         axis=1
     ).max(axis=1)
 
     return tr.ewm(
-        alpha=1 / n,
+        alpha=1 / period,
         adjust=False
     ).mean()
 
@@ -183,63 +231,69 @@ def atr(d, n=14):
 # ADX
 # =========================================================
 
-def adx(d, n=14):
+def calculate_adx(df, period=14):
 
-    up = d.h.diff()
+    up = df["high"].diff()
 
-    down = -d.l.diff()
+    down = -df["low"].diff()
 
-    tr = atr(d, 1)
-
-    smooth_tr = tr.ewm(
-        alpha=1 / n,
-        adjust=False
-    ).mean()
-
-    plus = 100 * (
-        up.where(
-            (up > down) & (up > 0),
-            0
-        ).ewm(
-            alpha=1 / n,
-            adjust=False
-        ).mean()
-        /
-        smooth_tr
+    plus_dm = up.where(
+        (up > down) & (up > 0),
+        0
     )
 
-    minus = 100 * (
-        down.where(
-            (down > up) & (down > 0),
-            0
-        ).ewm(
-            alpha=1 / n,
+    minus_dm = down.where(
+        (down > up) & (down > 0),
+        0
+    )
+
+    atr = calculate_atr(
+        df,
+        period
+    )
+
+    plus_di = (
+        100
+        *
+        plus_dm.ewm(
+            alpha=1 / period,
             adjust=False
         ).mean()
         /
-        smooth_tr
+        atr.replace(0, np.nan)
+    )
+
+    minus_di = (
+        100
+        *
+        minus_dm.ewm(
+            alpha=1 / period,
+            adjust=False
+        ).mean()
+        /
+        atr.replace(0, np.nan)
     )
 
     dx = (
         100
         *
-        (plus - minus).abs()
+        (plus_di - minus_di).abs()
         /
-        (plus + minus).replace(
+        (plus_di + minus_di).replace(
             0,
             np.nan
         )
     )
 
-    adx_value = dx.ewm(
-        alpha=1 / n,
+    adx = dx.ewm(
+        alpha=1 / period,
         adjust=False
     ).mean()
 
     return (
-        adx_value,
-        plus,
-        minus
+        adx,
+        plus_di,
+        minus_di
     )
 
 
@@ -247,39 +301,40 @@ def adx(d, n=14):
 # TEKNIK VERILER
 # =========================================================
 
-def features(d):
+def features(df):
 
-    c = d.c
-    v = d.v
+    close = df["close"]
 
-    e9 = c.ewm(
+    volume = df["volume"]
+
+    ema9 = close.ewm(
         span=9,
         adjust=False
     ).mean()
 
-    e21 = c.ewm(
+    ema21 = close.ewm(
         span=21,
         adjust=False
     ).mean()
 
-    e50 = c.ewm(
+    ema50 = close.ewm(
         span=50,
         adjust=False
     ).mean()
 
-    e200 = c.ewm(
+    ema200 = close.ewm(
         span=200,
         adjust=False
     ).mean()
 
-    rr = rsi(c)
+    rsi = calculate_rsi(close)
 
-    ema12 = c.ewm(
+    ema12 = close.ewm(
         span=12,
         adjust=False
     ).mean()
 
-    ema26 = c.ewm(
+    ema26 = close.ewm(
         span=26,
         adjust=False
     ).mean()
@@ -291,14 +346,14 @@ def features(d):
         adjust=False
     ).mean()
 
-    ax, di_plus, di_minus = adx(d)
+    adx, plus_di, minus_di = calculate_adx(df)
 
-    volume_average = (
-        v.rolling(20).mean()
-    )
+    volume_average = volume.rolling(
+        20
+    ).mean()
 
     volume_ratio = (
-        v
+        volume
         /
         volume_average.replace(
             0,
@@ -306,20 +361,16 @@ def features(d):
         )
     )
 
-    middle = (
-        c.rolling(20).mean()
-    )
+    middle = close.rolling(20).mean()
 
-    std = (
-        c.rolling(20).std()
-    )
+    std = close.rolling(20).std()
 
-    lower = middle - 2 * std
+    lower = middle - (2 * std)
 
-    upper = middle + 2 * std
+    upper = middle + (2 * std)
 
-    bb_position = (
-        (c - lower)
+    bollinger = (
+        (close - lower)
         /
         (upper - lower).replace(
             0,
@@ -327,67 +378,200 @@ def features(d):
         )
     )
 
-    taker_buy_ratio = (
-        d.tb
+    taker_ratio = (
+        df["taker_buy"]
         /
-        d.v.replace(
+        volume.replace(
             0,
             np.nan
         )
     )
 
     previous_high = (
-        d.h.shift(1)
+        df["high"]
+        .shift(1)
         .rolling(20)
         .max()
     )
 
     previous_low = (
-        d.l.shift(1)
+        df["low"]
+        .shift(1)
         .rolling(20)
         .min()
     )
 
     return {
-        "price": c.iloc[-1],
 
-        "e9": e9.iloc[-1],
-        "e21": e21.iloc[-1],
-        "e50": e50.iloc[-1],
-        "e200": e200.iloc[-1],
+        "price": close.iloc[-1],
 
-        "rsi": rr.iloc[-1],
+        "ema9": ema9.iloc[-1],
+        "ema21": ema21.iloc[-1],
+        "ema50": ema50.iloc[-1],
+        "ema200": ema200.iloc[-1],
 
-        "mac": macd.iloc[-1],
-        "sig": macd_signal.iloc[-1],
+        "rsi": rsi.iloc[-1],
 
-        "adx": ax.iloc[-1],
+        "macd": macd.iloc[-1],
+        "macd_signal": macd_signal.iloc[-1],
 
-        "dip": di_plus.iloc[-1],
-        "dim": di_minus.iloc[-1],
+        "adx": adx.iloc[-1],
 
-        "vr": volume_ratio.iloc[-1],
+        "plus_di": plus_di.iloc[-1],
+        "minus_di": minus_di.iloc[-1],
 
-        "bb": bb_position.iloc[-1],
+        "volume_ratio": volume_ratio.iloc[-1],
 
-        "br": taker_buy_ratio.iloc[-1],
+        "bollinger": bollinger.iloc[-1],
 
-        "break_hi": (
-            c.iloc[-1]
+        "taker_ratio": taker_ratio.iloc[-1],
+
+        "breakout":
+            close.iloc[-1]
             >
-            previous_high.iloc[-1]
-        ),
+            previous_high.iloc[-1],
 
-        "break_lo": (
-            c.iloc[-1]
+        "breakdown":
+            close.iloc[-1]
             <
             previous_low.iloc[-1]
-        )
     }
 
 
 # =========================================================
-# PUANLAMA
+# DESTEK / DIRENC SWING NOKTALARI
+# =========================================================
+
+def swing_levels(df, window=3):
+
+    highs = df["high"].values
+
+    lows = df["low"].values
+
+    resistances = []
+
+    supports = []
+
+    # Son açık/aktif mumu kullanma
+    end = len(df) - 1
+
+    for i in range(
+        window,
+        end - window
+    ):
+
+        high_area = highs[
+            i - window:
+            i + window + 1
+        ]
+
+        low_area = lows[
+            i - window:
+            i + window + 1
+        ]
+
+        if highs[i] >= np.max(high_area):
+
+            resistances.append(
+                float(highs[i])
+            )
+
+        if lows[i] <= np.min(low_area):
+
+            supports.append(
+                float(lows[i])
+            )
+
+    return (
+        supports,
+        resistances
+    )
+
+
+# =========================================================
+# BENZER SEVIYELERI BIRLESTIR
+# =========================================================
+
+def merge_levels(levels, tolerance=0.003):
+
+    if not levels:
+        return []
+
+    levels = sorted(levels)
+
+    groups = []
+
+    current = [
+        levels[0]
+    ]
+
+    for level in levels[1:]:
+
+        average = sum(current) / len(current)
+
+        if (
+            abs(level - average)
+            /
+            average
+            <=
+            tolerance
+        ):
+
+            current.append(level)
+
+        else:
+
+            groups.append(
+                sum(current)
+                /
+                len(current)
+            )
+
+            current = [
+                level
+            ]
+
+    groups.append(
+        sum(current)
+        /
+        len(current)
+    )
+
+    return groups
+
+
+# =========================================================
+# 15M + 1H DESTEK DIRENC
+# =========================================================
+
+def support_resistance(df15, df1h):
+
+    s15, r15 = swing_levels(
+        df15,
+        3
+    )
+
+    s1h, r1h = swing_levels(
+        df1h,
+        2
+    )
+
+    supports = merge_levels(
+        s15 + s1h
+    )
+
+    resistances = merge_levels(
+        r15 + r1h
+    )
+
+    return (
+        supports,
+        resistances
+    )
+
+
+# =========================================================
+# SKOR
 # =========================================================
 
 def score(f, direction):
@@ -401,37 +585,31 @@ def score(f, direction):
         checks = [
 
             (
-                f["e9"]
+                f["ema9"]
                 >
-                f["e21"]
+                f["ema21"]
                 >
-                f["e50"],
+                f["ema50"],
                 18,
                 "EMA trend"
             ),
 
             (
-                f["price"]
-                >
-                f["e200"],
+                f["price"] > f["ema200"],
                 8,
                 "EMA200"
             ),
 
             (
-                f["mac"]
+                f["macd"]
                 >
-                f["sig"],
+                f["macd_signal"],
                 12,
                 "MACD"
             ),
 
             (
-                50
-                <=
-                f["rsi"]
-                <=
-                70,
+                50 <= f["rsi"] <= 70,
                 10,
                 "RSI"
             ),
@@ -439,25 +617,27 @@ def score(f, direction):
             (
                 f["adx"] >= 22
                 and
-                f["dip"] > f["dim"],
+                f["plus_di"]
+                >
+                f["minus_di"],
                 12,
                 "ADX/DI"
             ),
 
             (
-                f["vr"] >= 1.5,
+                f["volume_ratio"] >= 1.5,
                 14,
                 "Hacim"
             ),
 
             (
-                f["br"] >= 0.52,
+                f["taker_ratio"] >= 0.52,
                 8,
-                "Taker Buy"
+                "Alıcı baskısı"
             ),
 
             (
-                f["break_hi"],
+                f["breakout"],
                 10,
                 "Breakout"
             ),
@@ -465,7 +645,7 @@ def score(f, direction):
             (
                 0.45
                 <=
-                f["bb"]
+                f["bollinger"]
                 <=
                 1.15,
                 8,
@@ -478,37 +658,31 @@ def score(f, direction):
         checks = [
 
             (
-                f["e9"]
+                f["ema9"]
                 <
-                f["e21"]
+                f["ema21"]
                 <
-                f["e50"],
+                f["ema50"],
                 18,
                 "EMA trend"
             ),
 
             (
-                f["price"]
-                <
-                f["e200"],
+                f["price"] < f["ema200"],
                 8,
                 "EMA200"
             ),
 
             (
-                f["mac"]
+                f["macd"]
                 <
-                f["sig"],
+                f["macd_signal"],
                 12,
                 "MACD"
             ),
 
             (
-                30
-                <=
-                f["rsi"]
-                <=
-                50,
+                30 <= f["rsi"] <= 50,
                 10,
                 "RSI"
             ),
@@ -516,25 +690,27 @@ def score(f, direction):
             (
                 f["adx"] >= 22
                 and
-                f["dim"] > f["dip"],
+                f["minus_di"]
+                >
+                f["plus_di"],
                 12,
                 "ADX/DI"
             ),
 
             (
-                f["vr"] >= 1.5,
+                f["volume_ratio"] >= 1.5,
                 14,
                 "Hacim"
             ),
 
             (
-                f["br"] <= 0.48,
+                f["taker_ratio"] <= 0.48,
                 8,
-                "Taker Sell"
+                "Satıcı baskısı"
             ),
 
             (
-                f["break_lo"],
+                f["breakdown"],
                 10,
                 "Breakdown"
             ),
@@ -542,7 +718,7 @@ def score(f, direction):
             (
                 -0.15
                 <=
-                f["bb"]
+                f["bollinger"]
                 <=
                 0.55,
                 8,
@@ -550,19 +726,18 @@ def score(f, direction):
             )
         ]
 
-    for ok, weight, reason in checks:
+    for condition, points, reason in checks:
 
         try:
-            valid = bool(ok)
 
-        except Exception:
-            valid = False
+            if bool(condition):
 
-        if valid:
+                total += points
 
-            total += weight
+                reasons.append(reason)
 
-            reasons.append(reason)
+        except:
+            pass
 
     return (
         min(total, 100),
@@ -571,24 +746,231 @@ def score(f, direction):
 
 
 # =========================================================
-# COIN ANALIZI
-# BTC VERISI DISARIDAN GELIYOR
+# SL / TP HESAPLAMA
 # =========================================================
 
-def analyze(sym, btc):
+def calculate_trade_levels(
+    price,
+    direction,
+    supports,
+    resistances
+):
 
-    f15 = features(
-        klines(
-            sym,
-            "15m"
+    # Fiyatın %0.15 dibindeki seviyeleri
+    # hedef olarak kullanma
+    min_distance = price * 0.0015
+
+    if direction == "LONG":
+
+        below = sorted(
+            [
+                x
+                for x in supports
+                if x < price - min_distance
+            ],
+            reverse=True
         )
+
+        above = sorted(
+            [
+                x
+                for x in resistances
+                if x > price + min_distance
+            ]
+        )
+
+        # En az 2 direnç lazım
+        if len(above) < 2:
+            return None
+
+        # SL teknik desteğin biraz altı
+        max_sl = (
+            price * 0.98
+        )
+
+        if below:
+
+            technical_sl = (
+                below[0] * 0.997
+            )
+
+            # %2'den fazla risk olamaz
+            sl = max(
+                technical_sl,
+                max_sl
+            )
+
+        else:
+
+            sl = max_sl
+
+        tp1 = above[0]
+
+        # TP2 TP1'e aşırı yakın olmasın
+        tp2 = None
+
+        for resistance in above[1:]:
+
+            if (
+                resistance - tp1
+                >=
+                price * 0.003
+            ):
+
+                tp2 = resistance
+                break
+
+        if tp2 is None:
+            return None
+
+        risk = price - sl
+
+        reward1 = tp1 - price
+
+        reward2 = tp2 - price
+
+    else:
+
+        above = sorted(
+            [
+                x
+                for x in resistances
+                if x > price + min_distance
+            ]
+        )
+
+        below = sorted(
+            [
+                x
+                for x in supports
+                if x < price - min_distance
+            ],
+            reverse=True
+        )
+
+        # En az 2 destek lazım
+        if len(below) < 2:
+            return None
+
+        max_sl = (
+            price * 1.02
+        )
+
+        if above:
+
+            technical_sl = (
+                above[0] * 1.003
+            )
+
+            # %2'den fazla risk olamaz
+            sl = min(
+                technical_sl,
+                max_sl
+            )
+
+        else:
+
+            sl = max_sl
+
+        tp1 = below[0]
+
+        tp2 = None
+
+        for support in below[1:]:
+
+            if (
+                tp1 - support
+                >=
+                price * 0.003
+            ):
+
+                tp2 = support
+                break
+
+        if tp2 is None:
+            return None
+
+        risk = sl - price
+
+        reward1 = price - tp1
+
+        reward2 = price - tp2
+
+    if risk <= 0:
+        return None
+
+    rr1 = reward1 / risk
+
+    rr2 = reward2 / risk
+
+    # Kötü risk/getiri ise sinyal verme
+    if rr1 < MIN_TP1_RR:
+        return None
+
+    if rr2 < MIN_TP2_RR:
+        return None
+
+    tp1_percent = (
+        reward1
+        /
+        price
+        *
+        100
     )
 
-    f1h = features(
-        klines(
-            sym,
-            "1h"
-        )
+    tp2_percent = (
+        reward2
+        /
+        price
+        *
+        100
+    )
+
+    sl_percent = (
+        risk
+        /
+        price
+        *
+        100
+    )
+
+    return {
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+
+        "sl_percent": sl_percent,
+        "tp1_percent": tp1_percent,
+        "tp2_percent": tp2_percent,
+
+        "rr1": rr1,
+        "rr2": rr2
+    }
+
+
+# =========================================================
+# COIN ANALIZI
+# =========================================================
+
+def analyze(symbol, btc):
+
+    df15 = klines(
+        symbol,
+        "15m"
+    )
+
+    df1h = klines(
+        symbol,
+        "1h"
+    )
+
+    f15 = features(df15)
+
+    f1h = features(df1h)
+
+    supports, resistances = support_resistance(
+        df15,
+        df1h
     )
 
     output = []
@@ -611,20 +993,20 @@ def analyze(sym, btc):
         if direction == "LONG":
 
             btc_ok = (
-                btc["e9"]
+                btc["ema9"]
                 >=
-                btc["e21"]
+                btc["ema21"]
             )
 
         else:
 
             btc_ok = (
-                btc["e9"]
+                btc["ema9"]
                 <=
-                btc["e21"]
+                btc["ema21"]
             )
 
-        total = (
+        final_score = (
             0.58 * score15
             +
             0.32 * score1h
@@ -632,84 +1014,90 @@ def analyze(sym, btc):
             (10 if btc_ok else 0)
         )
 
-        total = min(
-            round(total, 1),
+        final_score = min(
+            round(final_score, 1),
             100
         )
 
-        if total >= MIN_SCORE:
+        if final_score < MIN_SCORE:
+            continue
 
-            price = float(
-                f15["price"]
+        price = float(
+            f15["price"]
+        )
+
+        levels = calculate_trade_levels(
+            price,
+            direction,
+            supports,
+            resistances
+        )
+
+        # Mantıklı destek/direnç hedefi yoksa
+        # sinyal gönderme
+        if levels is None:
+            continue
+
+        reasons = sorted(
+            set(
+                reasons15
+                +
+                reasons1h
             )
+        )
 
-            # =============================================
-            # SABIT YUZDE SL / TP
-            #
-            # SL  = %2
-            # TP1 = %5
-            # TP2 = %10
-            # =============================================
+        output.append({
 
-            if direction == "LONG":
+            "symbol": symbol,
 
-                sl = (
-                    price * 0.98
-                )
+            "direction": direction,
 
-                tp1 = (
-                    price * 1.05
-                )
+            "score": final_score,
 
-                tp2 = (
-                    price * 1.10
-                )
+            "price": price,
 
-            else:
+            "sl": levels["sl"],
 
-                sl = (
-                    price * 1.02
-                )
+            "tp1": levels["tp1"],
 
-                tp1 = (
-                    price * 0.95
-                )
+            "tp2": levels["tp2"],
 
-                tp2 = (
-                    price * 0.90
-                )
+            "sl_percent":
+                levels["sl_percent"],
 
-            reasons = sorted(
-                set(
-                    reasons15
-                    +
-                    reasons1h
-                )
-            )
+            "tp1_percent":
+                levels["tp1_percent"],
 
-            output.append(
-                (
-                    total,
-                    direction,
-                    price,
-                    sl,
-                    tp1,
-                    tp2,
-                    reasons,
-                    f15["rsi"],
-                    f15["vr"],
-                    f15["adx"]
-                )
-            )
+            "tp2_percent":
+                levels["tp2_percent"],
+
+            "rr1":
+                levels["rr1"],
+
+            "rr2":
+                levels["rr2"],
+
+            "rsi":
+                f15["rsi"],
+
+            "volume_ratio":
+                f15["volume_ratio"],
+
+            "adx":
+                f15["adx"],
+
+            "reasons":
+                reasons
+        })
 
     return output
 
 
 # =========================================================
-# TELEGRAM MESAJ GONDERME
+# TELEGRAM
 # =========================================================
 
-def telegram(msg, chat_id=None):
+def telegram(message, chat_id=None):
 
     target = (
         chat_id
@@ -726,23 +1114,26 @@ def telegram(msg, chat_id=None):
 
         return
 
-    r = requests.post(
+    response = requests.post(
+
         f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+
         json={
             "chat_id": target,
-            "text": msg
+            "text": message
         },
-        timeout=15
+
+        timeout=20
     )
 
-    r.raise_for_status()
+    response.raise_for_status()
 
 
 # =========================================================
-# CALISMA SURESI
+# UPTIME
 # =========================================================
 
-def uptime_text():
+def uptime():
 
     seconds = int(
         time.time()
@@ -750,9 +1141,7 @@ def uptime_text():
         bot_started
     )
 
-    hours = (
-        seconds // 3600
-    )
+    hours = seconds // 3600
 
     minutes = (
         seconds % 3600
@@ -768,79 +1157,91 @@ def uptime_text():
 # DURUM
 # =========================================================
 
-def send_status(chat_id):
+def status(chat_id):
 
     if scan_running:
 
-        state = (
-            "🔎 Tarama yapılıyor"
-        )
+        state = "🔎 Tarama yapılıyor"
 
     else:
 
-        state = (
-            "🟢 Çalışıyor"
-        )
+        state = "🟢 Çalışıyor"
 
     if last_scan_time:
 
-        seconds_ago = int(
+        ago = int(
             time.time()
             -
             last_scan_time
         )
 
-        last_text = (
-            f"{seconds_ago} saniye önce"
+        last = (
+            f"{ago} saniye önce"
         )
 
     else:
 
-        last_text = (
-            "Henüz tamamlanmadı"
-        )
+        last = "Henüz tamamlanmadı"
 
     if last_scan_duration is not None:
 
-        duration_text = (
-            f"{last_scan_duration:.1f} sn"
+        duration = (
+            f"{last_scan_duration:.1f} saniye"
         )
 
     else:
 
-        duration_text = "-"
+        duration = "-"
 
-    msg = (
-        "📊 COIN RADAR V3 DURUMU\n\n"
+    message = (
+
+        "📊 COIN RADAR DURUMU\n\n"
 
         f"Durum: {state}\n"
-        f"Çalışma süresi: {uptime_text()}\n\n"
 
-        f"Minimum skor: {MIN_SCORE}/100\n"
-        "Tarama: Tüm aktif USDT Perpetual\n"
-        f"Tarama aralığı: {INTERVAL} sn\n\n"
+        f"Çalışma süresi: "
+        f"{uptime()}\n\n"
 
-        f"Son tarama: {last_text}\n"
-        f"Son tarama süresi: {duration_text}\n"
-        f"Taranan coin: {last_scan_count}\n"
-        f"Yeni sinyal: {last_signal_count}\n\n"
+        f"Minimum skor: "
+        f"{MIN_SCORE}/100\n"
 
-        "Zaman dilimleri: 15m + 1h\n"
-        "Yönler: LONG + SHORT\n\n"
+        "Minimum 24h hacim: $10M\n"
 
-        "🛑 SL: %2\n"
-        "🎯 TP1: %5\n"
-        "🎯 TP2: %10"
+        "Analiz: 15m + 1h\n"
+
+        "Yön: LONG + SHORT\n\n"
+
+        "🛑 SL: Teknik / maksimum %2\n"
+
+        "🎯 TP1: Destek/direnç\n"
+
+        "🚀 TP2: Destek/direnç\n\n"
+
+        "Minimum R:R:\n"
+
+        f"TP1: {MIN_TP1_RR:.1f}R\n"
+
+        f"TP2: {MIN_TP2_RR:.1f}R\n\n"
+
+        f"Son tarama: {last}\n"
+
+        f"Tarama süresi: {duration}\n"
+
+        f"Taranan coin: "
+        f"{last_scan_count}\n"
+
+        f"Yeni sinyal: "
+        f"{last_signal_count}"
     )
 
     telegram(
-        msg,
+        message,
         chat_id
     )
 
 
 # =========================================================
-# PIYASA TARAMASI
+# TARAMA
 # =========================================================
 
 def scan_market(manual_chat=None):
@@ -858,7 +1259,7 @@ def scan_market(manual_chat=None):
         if manual_chat:
 
             telegram(
-                "⏳ Zaten bir tarama devam ediyor.",
+                "⏳ Tarama zaten devam ediyor.",
                 manual_chat
             )
 
@@ -866,28 +1267,28 @@ def scan_market(manual_chat=None):
 
     scan_running = True
 
-    start_time = time.time()
+    started = time.time()
 
     try:
 
         coin_list = symbols()
 
         print(
-            f"Tarama basladi: "
-            f"{len(coin_list)} coin",
+            f"10M+ hacimli "
+            f"{len(coin_list)} coin bulundu.",
             flush=True
         )
 
         if manual_chat:
 
             telegram(
-                "🔎 Manuel tarama başladı.\n\n"
-                f"{len(coin_list)} aktif USDT "
-                "Perpetual coin kontrol ediliyor.",
+                "🔎 Tarama başladı.\n\n"
+                f"{len(coin_list)} coin "
+                "analiz ediliyor.",
                 manual_chat
             )
 
-        # BTC VERISINI SADECE 1 KEZ CEK
+        # BTC SADECE 1 KEZ CEKILIR
         btc = features(
             klines(
                 "BTCUSDT",
@@ -895,35 +1296,26 @@ def scan_market(manual_chat=None):
             )
         )
 
-        signal_count = 0
+        signals = 0
 
-        for sym in coin_list:
+        processed = 0
+
+        for symbol, volume24 in coin_list:
 
             try:
 
                 results = analyze(
-                    sym,
+                    symbol,
                     btc
                 )
 
+                processed += 1
+
                 for result in results:
 
-                    (
-                        sc,
-                        direction,
-                        price,
-                        sl,
-                        tp1,
-                        tp2,
-                        reasons,
-                        current_rsi,
-                        volume_ratio,
-                        current_adx
-                    ) = result
-
                     key = (
-                        sym,
-                        direction
+                        result["symbol"],
+                        result["direction"]
                     )
 
                     now = time.time()
@@ -938,89 +1330,116 @@ def scan_market(manual_chat=None):
                         <
                         ALERT_COOLDOWN
                     ):
-
                         continue
 
-                    if direction == "LONG":
+                    if result["direction"] == "LONG":
 
-                        direction_icon = "🟢"
+                        icon = "🟢"
+
+                        sl_sign = "-"
+                        tp_sign = "+"
 
                     else:
 
-                        direction_icon = "🔴"
+                        icon = "🔴"
 
-                    msg = (
-                        f"🔥 {sym}\n\n"
+                        sl_sign = "+"
+                        tp_sign = "-"
 
-                        f"{direction_icon} "
-                        f"Yön: {direction}\n"
-
-                        f"⭐ Radar skoru: "
-                        f"{sc}/100\n\n"
-
-                        f"💰 Giriş: "
-                        f"{price:.8g}\n\n"
-
-                        f"🛑 SL (%2): "
-                        f"{sl:.8g}\n"
-
-                        f"🎯 TP1 (%5): "
-                        f"{tp1:.8g}\n"
-
-                        f"🚀 TP2 (%10): "
-                        f"{tp2:.8g}\n\n"
-
-                        f"RSI: "
-                        f"{current_rsi:.1f}\n"
-
-                        f"Hacim: "
-                        f"x{volume_ratio:.2f}\n"
-
-                        f"ADX: "
-                        f"{current_adx:.1f}\n\n"
-
-                        f"Onaylar:\n"
-                        f"{', '.join(reasons)}\n\n"
-
-                        "⚠️ Radar skoru gerçek "
-                        "kazanma olasılığı değildir."
+                    volume_m = (
+                        volume24
+                        /
+                        1_000_000
                     )
 
-                    telegram(msg)
+                    message = (
+
+                        f"🔥 {result['symbol']}\n\n"
+
+                        f"{icon} "
+                        f"{result['direction']}\n"
+
+                        f"⭐ Radar skoru: "
+                        f"{result['score']}/100\n\n"
+
+                        f"💰 Giriş: "
+                        f"{result['price']:.8g}\n\n"
+
+                        f"🛑 SL: "
+                        f"{result['sl']:.8g} "
+                        f"({sl_sign}"
+                        f"%{result['sl_percent']:.2f})\n\n"
+
+                        f"🎯 TP1: "
+                        f"{result['tp1']:.8g} "
+                        f"({tp_sign}"
+                        f"%{result['tp1_percent']:.2f})\n"
+
+                        f"R:R TP1: "
+                        f"1:{result['rr1']:.2f}\n\n"
+
+                        f"🚀 TP2: "
+                        f"{result['tp2']:.8g} "
+                        f"({tp_sign}"
+                        f"%{result['tp2_percent']:.2f})\n"
+
+                        f"R:R TP2: "
+                        f"1:{result['rr2']:.2f}\n\n"
+
+                        f"24h Futures hacmi: "
+                        f"${volume_m:.1f}M\n"
+
+                        f"RSI: "
+                        f"{result['rsi']:.1f}\n"
+
+                        f"Hacim oranı: "
+                        f"x{result['volume_ratio']:.2f}\n"
+
+                        f"ADX: "
+                        f"{result['adx']:.1f}\n\n"
+
+                        "Onaylar:\n"
+
+                        f"{', '.join(result['reasons'])}\n\n"
+
+                        "TP seviyeleri 15m + 1h "
+                        "destek/dirençlerden hesaplandı.\n"
+
+                        "⚠️ Radar skoru kazanma "
+                        "olasılığı değildir."
+                    )
+
+                    telegram(message)
 
                     last_alert[key] = now
 
-                    signal_count += 1
+                    signals += 1
 
             except Exception as e:
 
                 print(
-                    f"{sym} hata: {e}",
+                    f"{symbol} hata: {e}",
                     flush=True
                 )
 
         duration = (
             time.time()
             -
-            start_time
+            started
         )
 
         last_scan_time = time.time()
 
         last_scan_duration = duration
 
-        last_scan_count = len(
-            coin_list
-        )
+        last_scan_count = processed
 
-        last_signal_count = (
-            signal_count
-        )
+        last_signal_count = signals
 
         print(
-            f"Tarama tamamlandi: "
-            f"{len(coin_list)} coin | "
-            f"{signal_count} sinyal | "
+            f"Tarama tamamlandi | "
+            f"{processed} coin | "
+            f"{signals} sinyal | "
             f"{duration:.1f} saniye",
             flush=True
         )
@@ -1028,29 +1447,24 @@ def scan_market(manual_chat=None):
         if manual_chat:
 
             telegram(
-                "✅ Manuel tarama tamamlandı.\n\n"
-                f"Taranan coin: "
-                f"{len(coin_list)}\n"
-                f"90+ yeni sinyal: "
-                f"{signal_count}\n"
-                f"Süre: "
-                f"{duration:.1f} saniye",
+                "✅ Tarama tamamlandı.\n\n"
+                f"Taranan: {processed}\n"
+                f"Yeni sinyal: {signals}\n"
+                f"Süre: {duration:.1f} saniye",
                 manual_chat
             )
 
     except Exception as e:
 
         print(
-            "Tarama genel hatasi:",
-            e,
+            f"Genel tarama hatasi: {e}",
             flush=True
         )
 
         if manual_chat:
 
             telegram(
-                "❌ Tarama hatası:\n"
-                f"{e}",
+                f"❌ Tarama hatası:\n{e}",
                 manual_chat
             )
 
@@ -1093,20 +1507,23 @@ def telegram_commands():
 
         try:
 
-            r = requests.get(
+            response = requests.get(
+
                 f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+
                 params={
                     "timeout": 25,
                     "offset": telegram_offset
                 },
+
                 timeout=35
             )
 
-            r.raise_for_status()
+            response.raise_for_status()
 
-            data = r.json()
+            updates = response.json()
 
-            for update in data.get(
+            for update in updates.get(
                 "result",
                 []
             ):
@@ -1141,8 +1558,6 @@ def telegram_commands():
                 if not chat_id:
                     continue
 
-                # Sadece ayarlanan Telegram
-                # sohbetinden komut kabul et
                 if (
                     CHAT
                     and
@@ -1150,7 +1565,6 @@ def telegram_commands():
                     !=
                     str(CHAT)
                 ):
-
                     continue
 
                 if text in [
@@ -1160,29 +1574,37 @@ def telegram_commands():
                 ]:
 
                     telegram(
-                        "🤖 COIN RADAR V3\n\n"
 
-                        "Komutlar:\n\n"
+                        "🤖 COIN RADAR\n\n"
 
-                        "/durum - Bot durumunu göster\n"
+                        "/durum - Bot durumu\n"
 
-                        "/tara - Hemen tüm piyasayı tara\n"
+                        "/tara - Hemen tara\n"
 
-                        "/yardim - Komutları göster\n\n"
+                        "/yardim - Yardım\n\n"
 
-                        "Filtre:\n"
-                        "Minimum 90/100\n\n"
+                        "Filtreler:\n"
 
-                        "Risk seviyeleri:\n"
-                        "SL %2\n"
-                        "TP1 %5\n"
-                        "TP2 %10",
+                        "24h hacim ≥ $10M\n"
+
+                        f"Skor ≥ {MIN_SCORE}\n"
+
+                        "15m + 1h\n"
+
+                        "LONG + SHORT\n\n"
+
+                        "SL: Teknik, max %2\n"
+
+                        "TP1: Destek/direnç\n"
+
+                        "TP2: Destek/direnç",
+
                         chat_id
                     )
 
                 elif text == "/durum":
 
-                    send_status(
+                    status(
                         chat_id
                     )
 
@@ -1191,9 +1613,8 @@ def telegram_commands():
                     if scan_running:
 
                         telegram(
-                            "⏳ Şu anda bir tarama "
-                            "devam ediyor.\n\n"
-                            "Tamamlanınca tekrar dene.",
+                            "⏳ Şu anda tarama "
+                            "devam ediyor.",
                             chat_id
                         )
 
@@ -1208,8 +1629,7 @@ def telegram_commands():
         except Exception as e:
 
             print(
-                "Telegram komut hatasi:",
-                e,
+                f"Telegram komut hatasi: {e}",
                 flush=True
             )
 
@@ -1223,30 +1643,33 @@ def telegram_commands():
 def run():
 
     print(
-        "Coin Radar V3 started",
+        "COIN RADAR BASLADI",
         flush=True
     )
 
     try:
 
         telegram(
-            "🟢 COIN RADAR V3 AKTİF\n\n"
 
-            "Tüm aktif Binance USDT "
-            "Perpetual coinleri taranıyor.\n\n"
+            "🟢 COIN RADAR AKTİF\n\n"
+
+            "24h Futures hacmi ≥ $10M\n"
 
             f"Minimum skor: "
             f"{MIN_SCORE}/100\n"
 
-            "Zaman: 15m + 1h\n"
+            "Analiz: 15m + 1h\n"
 
-            "Yön: LONG + SHORT\n\n"
+            "LONG + SHORT\n\n"
 
-            "🛑 SL: %2\n"
-            "🎯 TP1: %5\n"
-            "🚀 TP2: %10\n\n"
+            "🛑 SL: Teknik, maksimum %2\n"
 
-            "Komutlar:\n"
+            "🎯 TP1: Destek/direnç\n"
+
+            "🚀 TP2: Destek/direnç\n\n"
+
+            "Kötü R:R olan sinyaller elenir.\n\n"
+
             "/durum\n"
             "/tara\n"
             "/yardim"
@@ -1255,8 +1678,7 @@ def run():
     except Exception as e:
 
         print(
-            "Telegram baslangic hatasi:",
-            e,
+            f"Telegram baslangic hatasi: {e}",
             flush=True
         )
 
