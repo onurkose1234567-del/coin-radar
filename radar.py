@@ -50,33 +50,21 @@ def get(path, params=None):
 
 
 def symbols():
-    tick = get("/fapi/v1/ticker/24hr")
-
-    xs = [
-        x for x in tick
-        if x["symbol"].endswith("USDT")
-        and float(x.get("quoteVolume", 0)) > 0
-    ]
-
-    xs.sort(
-        key=lambda x: float(x["quoteVolume"]),
-        reverse=True
-    )
+    info = get("/fapi/v1/exchangeInfo")
 
     result = []
 
-    for x in xs:
-        sym = x["symbol"]
-
-        if sym == "USDCUSDT":
-            continue
-
-        result.append(sym)
-
-        if len(result) >= TOP:
-            break
+    for x in info["symbols"]:
+        if (
+            x["quoteAsset"] == "USDT"
+            and x["contractType"] == "PERPETUAL"
+            and x["status"] == "TRADING"
+        ):
+            result.append(x["symbol"])
 
     return result
+
+    
 
 
 def klines(sym, interval, limit=220):
