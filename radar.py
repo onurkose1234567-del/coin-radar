@@ -1,127 +1,311 @@
 import os
 import time
+import math
 import threading
 import requests
 import numpy as np
 import pandas as pd
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# =========================================================
+# ============================================================
 # AYARLAR
-# =========================================================
+# ============================================================
 
 BASE = "https://fapi.binance.com"
-
-MIN_SCORE = float(os.getenv("MIN_SCORE", "80"))
-MIN_VOLUME = 10_000_000          # Minimum 24h Futures hacmi
-INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "60"))
-
-MAX_SL_PERCENT = 2.0             # SL maksimum %2
-MIN_TP1_RR = 1.0                 # TP1 en az 1R
-MIN_TP2_RR = 2.0                 # TP2 en az 2R
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 
-ALERT_COOLDOWN = 3600
+# Minimum TOPLAM skor
+MIN_SCORE = float(os.getenv("MIN_SCORE", "80"))
 
-last_alert = {}
+# Haber olmasa bile teknik tarafın minimum kalitesi
+MIN_TECH_SCORE = float(os.getenv("MIN_TECH_SCORE", "72"))
 
-bot_started = time.time()
+# Binance Futures minimum 24 saatlik quote hacmi
+MIN_VOLUME = float(os.getenv("MIN_VOLUME", "10000000"))
 
-last_scan_time = None
-last_scan_duration = None
+# Tarama aralığı
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL_SECONDS", "180"))
+
+# Aynı coin/yön tekrar alarm süresi
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN_SECONDS", "3600"))
+
+# Maksimum SL uzaklığı
+MAX_SL_PERCENT = 2.0
+
+# Haberlerin kaç saat yeni sayılacağı
+NEWS_MAX_AGE_HOURS = 12
+
+# Haberleri kaç dakikada bir yenile
+NEWS_REFRESH_SECONDS = 300
+
+# Her taramada maksimum kaç coin analiz edilsin.
+# Hacmi en yüksek olanlardan başlanır.
+MAX_SYMBOLS_PER_SCAN = int(os.getenv("MAX_SYMBOLS_PER_SCAN", "120"))
+
+# HTTP
+REQUEST_TIMEOUT = 12
+
+session = requests.Session()
+session.headers.update({
+    "User-Agent": "CoinRadarV5/1.0"
+})
+
+# ============================================================
+# HABER KAYNAKLARI
+# ============================================================
+
+NEWS_FEEDS = {
+    "CoinDesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "Cointelegraph": "https://cointelegraph.com/rss",
+    "Decrypt": "https://decrypt.co/feed",
+    "CryptoSlate": "https://cryptoslate.com/feed/",
+}
+
+# Güçlü katalizör kelimeleri
+STRONG_NEWS_WORDS = [
+    "hack",
+    "hacked",
+    "exploit",
+    "breach",
+    "stolen",
+    "attack",
+    "listing",
+    "listed",
+    "delisting",
+    "delisted",
+    "etf",
+    "approval",
+    "approved",
+    "lawsuit",
+    "sec",
+    "regulation",
+    "partnership",
+    "partners",
+    "launch",
+    "mainnet",
+    "upgrade",
+    "token unlock",
+    "unlock",
+    "burn",
+    "airdrop",
+    "acquisition",
+    "acquires",
+    "bankruptcy",
+    "investigation",
+    "settlement",
+]
+
+MEDIUM_NEWS_WORDS = [
+    "whale",
+    "institutional",
+    "fund",
+    "investment",
+    "exchange",
+    "network",
+    "protocol",
+    "treasury",
+    "adoption",
+    "staking",
+    "validator",
+    "futures",
+    "open interest",
+]
+
+# Coin sembolü -> haberlerde aranabilecek isimler
+COIN_NAMES = {
+    "BTC": ["bitcoin", "btc"],
+    "ETH": ["ethereum", "ether", "eth"],
+    "SOL": ["solana", "sol"],
+    "XRP": ["xrp", "ripple"],
+    "BNB": ["bnb", "binance coin"],
+    "DOGE": ["dogecoin", "doge"],
+    "ADA": ["cardano", "ada"],
+    "AVAX": ["avalanche", "avax"],
+    "LINK": ["chainlink", "link"],
+    "DOT": ["polkadot", "dot"],
+    "LTC": ["litecoin", "ltc"],
+    "BCH": ["bitcoin cash", "bch"],
+    "UNI": ["uniswap", "uni"],
+    "AAVE": ["aave"],
+    "ARB": ["arbitrum", "arb"],
+    "OP": ["optimism", "op"],
+    "SUI": ["sui"],
+    "APT": ["aptos", "apt"],
+    "NEAR": ["near protocol", "near"],
+    "ATOM": ["cosmos", "atom"],
+    "FIL": ["filecoin", "fil"],
+    "INJ": ["injective", "inj"],
+    "TIA": ["celestia", "tia"],
+    "SEI": ["sei"],
+    "ENA": ["ethena", "ena"],
+    "WIF": ["dogwifhat", "wif"],
+    "PEPE": ["pepe"],
+    "SHIB": ["shiba inu", "shib"],
+    "TRX": ["tron", "trx"],
+    "TON": ["toncoin", "ton"],
+    "ARK": ["ark", "ark ecosystem"],
+}
+
+# ============================================================
+# GLOBAL DURUM
+# ============================================================
+
+start_time = time.time()
+
+last_scan_time = 0
+last_scan_duration = 0
 last_scan_count = 0
 last_signal_count = 0
 
-scan_running = False
+alerts = {}
+
+news_cache = []
+news_last_update = 0
+news_lock = threading.Lock()
+
 scan_lock = threading.Lock()
 
-telegram_offset = 0
+# ============================================================
+# HTTP
+# ============================================================
+
+def get_json(url, params=None, retries=3):
+    for attempt in range(retries):
+        try:
+            r = session.get(
+                url,
+                params=params,
+                timeout=REQUEST_TIMEOUT
+            )
+
+            if r.status_code == 429:
+                wait = 5 * (attempt + 1)
+                print(f"429 rate limit. {wait} sn bekleniyor...")
+                time.sleep(wait)
+                continue
+
+            r.raise_for_status()
+            return r.json()
+
+        except Exception as e:
+            print(f"HTTP hata: {url} -> {e}")
+
+            if attempt < retries - 1:
+                time.sleep(2 + attempt * 2)
+
+    return None
 
 
-# =========================================================
-# BINANCE API
-# =========================================================
+def get_text(url):
+    try:
+        r = session.get(url, timeout=REQUEST_TIMEOUT)
 
-def get(path, params=None):
+        if r.status_code == 200:
+            return r.text
 
-    r = requests.get(
-        BASE + path,
-        params=params,
-        timeout=20
-    )
+    except Exception as e:
+        print("RSS hata:", url, e)
 
-    r.raise_for_status()
+    return None
 
-    return r.json()
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def telegram(text):
+    if not TOKEN or not CHAT:
+        print("Telegram ayarları eksik.")
+        print(text)
+        return
+
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
+        session.post(
+            url,
+            data={
+                "chat_id": CHAT,
+                "text": text,
+                "disable_web_page_preview": True
+            },
+            timeout=12
+        )
+
+    except Exception as e:
+        print("Telegram hata:", e)
 
 
-# =========================================================
-# COIN LISTESI
-# SADECE 24H HACMI 10M+ OLANLAR
-# =========================================================
+def uptime():
+    sec = int(time.time() - start_time)
 
-def symbols():
+    h = sec // 3600
+    m = (sec % 3600) // 60
 
-    info = get("/fapi/v1/exchangeInfo")
+    return f"{h}s {m}dk"
 
-    tickers = get("/fapi/v1/ticker/24hr")
+# ============================================================
+# BINANCE SYMBOL / HACİM
+# ============================================================
 
-    active = set()
+def get_symbols():
+    exchange = get_json(BASE + "/fapi/v1/exchangeInfo")
+    tickers = get_json(BASE + "/fapi/v1/ticker/24hr")
 
-    for x in info["symbols"]:
+    if not exchange or not tickers:
+        return []
 
+    valid = {}
+
+    for s in exchange.get("symbols", []):
         if (
-            x.get("quoteAsset") == "USDT"
-            and x.get("contractType") == "PERPETUAL"
-            and x.get("status") == "TRADING"
+            s.get("status") == "TRADING"
+            and s.get("quoteAsset") == "USDT"
+            and s.get("contractType") == "PERPETUAL"
         ):
-            active.add(x["symbol"])
+            valid[s["symbol"]] = s.get("baseAsset", "")
 
     result = []
 
-    for ticker in tickers:
+    for t in tickers:
+        sym = t.get("symbol")
 
-        sym = ticker.get("symbol")
-
-        if sym not in active:
+        if sym not in valid:
             continue
 
         try:
-            volume = float(
-                ticker.get("quoteVolume", 0)
-            )
+            qv = float(t.get("quoteVolume", 0))
         except:
-            volume = 0
+            qv = 0
 
-        if volume >= MIN_VOLUME:
+        if qv >= MIN_VOLUME:
+            result.append({
+                "symbol": sym,
+                "base": valid[sym],
+                "volume": qv
+            })
 
-            result.append(
-                (
-                    sym,
-                    volume
-                )
-            )
-
+    # Hacmi yüksek coinlerden başla
     result.sort(
-        key=lambda x: x[1],
+        key=lambda x: x["volume"],
         reverse=True
     )
 
-    return result
+    return result[:MAX_SYMBOLS_PER_SCAN]
 
-
-# =========================================================
+# ============================================================
 # KLINE
-# =========================================================
+# ============================================================
 
 def klines(symbol, interval, limit=220):
-
-    data = get(
-        "/fapi/v1/klines",
+    data = get_json(
+        BASE + "/fapi/v1/klines",
         {
             "symbol": symbol,
             "interval": interval,
@@ -129,10 +313,13 @@ def klines(symbol, interval, limit=220):
         }
     )
 
+    if not data:
+        return None
+
     df = pd.DataFrame(
         data,
         columns=[
-            "time",
+            "open_time",
             "open",
             "high",
             "low",
@@ -141,40 +328,39 @@ def klines(symbol, interval, limit=220):
             "close_time",
             "quote_volume",
             "trades",
-            "taker_buy",
-            "taker_quote",
+            "taker_buy_base",
+            "taker_buy_quote",
             "ignore"
         ]
     )
 
-    for column in [
+    numeric = [
         "open",
         "high",
         "low",
         "close",
         "volume",
         "quote_volume",
-        "taker_buy"
-    ]:
+        "taker_buy_base",
+        "taker_buy_quote"
+    ]
 
-        df[column] = pd.to_numeric(
-            df[column],
+    for c in numeric:
+        df[c] = pd.to_numeric(
+            df[c],
             errors="coerce"
         )
 
     return df
 
-
-# =========================================================
-# RSI
-# =========================================================
+# ============================================================
+# INDIKATÖRLER
+# ============================================================
 
 def calculate_rsi(close, period=14):
-
     delta = close.diff()
 
     gain = delta.clip(lower=0)
-
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
@@ -187,36 +373,19 @@ def calculate_rsi(close, period=14):
         adjust=False
     ).mean()
 
-    rs = (
-        avg_gain
-        /
-        avg_loss.replace(0, np.nan)
-    )
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    return 100 - (
-        100 / (1 + rs)
-    )
+    return 100 - (100 / (1 + rs))
 
-
-# =========================================================
-# ATR
-# =========================================================
 
 def calculate_atr(df, period=14):
-
-    high = df["high"]
-
-    low = df["low"]
-
-    close = df["close"]
-
-    previous_close = close.shift(1)
+    prev_close = df["close"].shift(1)
 
     tr = pd.concat(
         [
-            high - low,
-            (high - previous_close).abs(),
-            (low - previous_close).abs()
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs()
         ],
         axis=1
     ).max(axis=1)
@@ -227,62 +396,65 @@ def calculate_atr(df, period=14):
     ).mean()
 
 
-# =========================================================
-# ADX
-# =========================================================
-
 def calculate_adx(df, period=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
 
-    up = df["high"].diff()
+    up = high.diff()
+    down = -low.diff()
 
-    down = -df["low"].diff()
-
-    plus_dm = up.where(
+    plus_dm = np.where(
         (up > down) & (up > 0),
-        0
+        up,
+        0.0
     )
 
-    minus_dm = down.where(
+    minus_dm = np.where(
         (down > up) & (down > 0),
-        0
+        down,
+        0.0
     )
 
-    atr = calculate_atr(
-        df,
-        period
-    )
+    prev_close = close.shift(1)
 
-    plus_di = (
-        100
-        *
-        plus_dm.ewm(
-            alpha=1 / period,
-            adjust=False
-        ).mean()
-        /
-        atr.replace(0, np.nan)
-    )
+    tr = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ],
+        axis=1
+    ).max(axis=1)
 
-    minus_di = (
-        100
-        *
-        minus_dm.ewm(
-            alpha=1 / period,
-            adjust=False
-        ).mean()
-        /
-        atr.replace(0, np.nan)
-    )
+    atr = tr.ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    plus_dm = pd.Series(
+        plus_dm,
+        index=df.index
+    ).ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    minus_dm = pd.Series(
+        minus_dm,
+        index=df.index
+    ).ewm(
+        alpha=1 / period,
+        adjust=False
+    ).mean()
+
+    plus_di = 100 * plus_dm / atr.replace(0, np.nan)
+    minus_di = 100 * minus_dm / atr.replace(0, np.nan)
 
     dx = (
         100
-        *
-        (plus_di - minus_di).abs()
-        /
-        (plus_di + minus_di).replace(
-            0,
-            np.nan
-        )
+        * (plus_di - minus_di).abs()
+        / (plus_di + minus_di).replace(0, np.nan)
     )
 
     adx = dx.ewm(
@@ -290,270 +462,207 @@ def calculate_adx(df, period=14):
         adjust=False
     ).mean()
 
-    return (
-        adx,
-        plus_di,
-        minus_di
-    )
+    return adx, plus_di, minus_di
 
-
-# =========================================================
-# TEKNIK VERILER
-# =========================================================
 
 def features(df):
+    d = df.copy()
 
-    close = df["close"]
-
-    volume = df["volume"]
-
-    ema9 = close.ewm(
+    d["ema9"] = d["close"].ewm(
         span=9,
         adjust=False
     ).mean()
 
-    ema21 = close.ewm(
+    d["ema21"] = d["close"].ewm(
         span=21,
         adjust=False
     ).mean()
 
-    ema50 = close.ewm(
+    d["ema50"] = d["close"].ewm(
         span=50,
         adjust=False
     ).mean()
 
-    ema200 = close.ewm(
+    d["ema200"] = d["close"].ewm(
         span=200,
         adjust=False
     ).mean()
 
-    rsi = calculate_rsi(close)
+    d["rsi"] = calculate_rsi(d["close"])
 
-    ema12 = close.ewm(
+    ema12 = d["close"].ewm(
         span=12,
         adjust=False
     ).mean()
 
-    ema26 = close.ewm(
+    ema26 = d["close"].ewm(
         span=26,
         adjust=False
     ).mean()
 
-    macd = ema12 - ema26
+    d["macd"] = ema12 - ema26
 
-    macd_signal = macd.ewm(
+    d["macd_signal"] = d["macd"].ewm(
         span=9,
         adjust=False
     ).mean()
 
-    adx, plus_di, minus_di = calculate_adx(df)
+    d["atr"] = calculate_atr(d)
 
-    volume_average = volume.rolling(
-        20
-    ).mean()
+    adx, plus_di, minus_di = calculate_adx(d)
 
-    volume_ratio = (
-        volume
-        /
-        volume_average.replace(
-            0,
-            np.nan
-        )
+    d["adx"] = adx
+    d["plus_di"] = plus_di
+    d["minus_di"] = minus_di
+
+    vol_avg = d["volume"].rolling(20).mean()
+
+    d["vol_ratio"] = (
+        d["volume"]
+        / vol_avg.replace(0, np.nan)
     )
 
-    middle = close.rolling(20).mean()
+    mid = d["close"].rolling(20).mean()
+    std = d["close"].rolling(20).std()
 
-    std = close.rolling(20).std()
+    upper = mid + 2 * std
+    lower = mid - 2 * std
 
-    lower = middle - (2 * std)
-
-    upper = middle + (2 * std)
-
-    bollinger = (
-        (close - lower)
-        /
-        (upper - lower).replace(
-            0,
-            np.nan
-        )
+    d["bb_pos"] = (
+        (d["close"] - lower)
+        / (upper - lower).replace(0, np.nan)
     )
 
-    taker_ratio = (
-        df["taker_buy"]
-        /
-        volume.replace(
-            0,
-            np.nan
-        )
+    d["taker_ratio"] = (
+        d["taker_buy_base"]
+        / d["volume"].replace(0, np.nan)
     )
 
-    previous_high = (
-        df["high"]
-        .shift(1)
-        .rolling(20)
-        .max()
+    return d
+
+# ============================================================
+# BREAKOUT / RETEST
+# ============================================================
+
+def breakout_retest(df, direction):
+    if len(df) < 30:
+        return False, False
+
+    close = df["close"]
+    high = df["high"]
+    low = df["low"]
+
+    # Son kapanan mum
+    current = float(close.iloc[-2])
+
+    # Önceki 20 mum
+    prev_high = float(
+        high.iloc[-22:-2].max()
     )
 
-    previous_low = (
-        df["low"]
-        .shift(1)
-        .rolling(20)
-        .min()
+    prev_low = float(
+        low.iloc[-22:-2].min()
     )
 
-    return {
+    breakout = False
+    retest = False
 
-        "price": close.iloc[-1],
+    if direction == "LONG":
+        breakout = current > prev_high
 
-        "ema9": ema9.iloc[-1],
-        "ema21": ema21.iloc[-1],
-        "ema50": ema50.iloc[-1],
-        "ema200": ema200.iloc[-1],
+        # Son birkaç mumda direnç üstüne kırıp
+        # tekrar seviyeyi test etmiş mi?
+        recent_high = close.iloc[-6:-2].max()
 
-        "rsi": rsi.iloc[-1],
+        if recent_high > prev_high:
+            recent_low = low.iloc[-4:-1].min()
 
-        "macd": macd.iloc[-1],
-        "macd_signal": macd_signal.iloc[-1],
+            tolerance = prev_high * 0.004
 
-        "adx": adx.iloc[-1],
+            if (
+                recent_low <= prev_high + tolerance
+                and current >= prev_high
+            ):
+                retest = True
 
-        "plus_di": plus_di.iloc[-1],
-        "minus_di": minus_di.iloc[-1],
+    else:
+        breakout = current < prev_low
 
-        "volume_ratio": volume_ratio.iloc[-1],
+        recent_low_close = close.iloc[-6:-2].min()
 
-        "bollinger": bollinger.iloc[-1],
+        if recent_low_close < prev_low:
+            recent_high = high.iloc[-4:-1].max()
 
-        "taker_ratio": taker_ratio.iloc[-1],
+            tolerance = prev_low * 0.004
 
-        "breakout":
-            close.iloc[-1]
-            >
-            previous_high.iloc[-1],
+            if (
+                recent_high >= prev_low - tolerance
+                and current <= prev_low
+            ):
+                retest = True
 
-        "breakdown":
-            close.iloc[-1]
-            <
-            previous_low.iloc[-1]
-    }
+    return breakout, retest
 
-
-# =========================================================
-# DESTEK / DIRENC SWING NOKTALARI
-# =========================================================
+# ============================================================
+# DESTEK / DİRENÇ
+# ============================================================
 
 def swing_levels(df, window=3):
-
-    highs = df["high"].values
-
-    lows = df["low"].values
-
+    supports = []
     resistances = []
 
-    supports = []
-
-    # Son açık/aktif mumu kullanma
-    end = len(df) - 1
+    highs = df["high"].values
+    lows = df["low"].values
 
     for i in range(
         window,
-        end - window
+        len(df) - window
     ):
-
-        high_area = highs[
-            i - window:
-            i + window + 1
-        ]
-
-        low_area = lows[
-            i - window:
-            i + window + 1
-        ]
-
-        if highs[i] >= np.max(high_area):
-
-            resistances.append(
-                float(highs[i])
-            )
-
-        if lows[i] <= np.min(low_area):
-
+        if lows[i] == min(
+            lows[i-window:i+window+1]
+        ):
             supports.append(
                 float(lows[i])
             )
 
-    return (
-        supports,
-        resistances
-    )
+        if highs[i] == max(
+            highs[i-window:i+window+1]
+        ):
+            resistances.append(
+                float(highs[i])
+            )
 
+    return supports, resistances
 
-# =========================================================
-# BENZER SEVIYELERI BIRLESTIR
-# =========================================================
 
 def merge_levels(levels, tolerance=0.003):
-
     if not levels:
         return []
 
     levels = sorted(levels)
 
-    groups = []
-
-    current = [
-        levels[0]
-    ]
+    merged = [levels[0]]
 
     for level in levels[1:]:
+        last = merged[-1]
 
-        average = sum(current) / len(current)
-
-        if (
-            abs(level - average)
-            /
-            average
-            <=
-            tolerance
-        ):
-
-            current.append(level)
-
+        if abs(level - last) / last <= tolerance:
+            merged[-1] = (
+                last + level
+            ) / 2
         else:
+            merged.append(level)
 
-            groups.append(
-                sum(current)
-                /
-                len(current)
-            )
+    return merged
 
-            current = [
-                level
-            ]
-
-    groups.append(
-        sum(current)
-        /
-        len(current)
-    )
-
-    return groups
-
-
-# =========================================================
-# 15M + 1H DESTEK DIRENC
-# =========================================================
 
 def support_resistance(df15, df1h):
-
     s15, r15 = swing_levels(
-        df15,
-        3
+        df15.tail(100)
     )
 
     s1h, r1h = swing_levels(
-        df1h,
-        2
+        df1h.tail(100)
     )
 
     supports = merge_levels(
@@ -564,689 +673,1049 @@ def support_resistance(df15, df1h):
         r15 + r1h
     )
 
-    return (
-        supports,
-        resistances
-    )
+    return supports, resistances
 
-
-# =========================================================
-# SKOR
-# =========================================================
-
-def score(f, direction):
-
-    total = 0
-
-    reasons = []
-
-    if direction == "LONG":
-
-        checks = [
-
-            (
-                f["ema9"]
-                >
-                f["ema21"]
-                >
-                f["ema50"],
-                18,
-                "EMA trend"
-            ),
-
-            (
-                f["price"] > f["ema200"],
-                8,
-                "EMA200"
-            ),
-
-            (
-                f["macd"]
-                >
-                f["macd_signal"],
-                12,
-                "MACD"
-            ),
-
-            (
-                50 <= f["rsi"] <= 70,
-                10,
-                "RSI"
-            ),
-
-            (
-                f["adx"] >= 22
-                and
-                f["plus_di"]
-                >
-                f["minus_di"],
-                12,
-                "ADX/DI"
-            ),
-
-            (
-                f["volume_ratio"] >= 1.5,
-                14,
-                "Hacim"
-            ),
-
-            (
-                f["taker_ratio"] >= 0.52,
-                8,
-                "Alıcı baskısı"
-            ),
-
-            (
-                f["breakout"],
-                10,
-                "Breakout"
-            ),
-
-            (
-                0.45
-                <=
-                f["bollinger"]
-                <=
-                1.15,
-                8,
-                "Bollinger"
-            )
-        ]
-
-    else:
-
-        checks = [
-
-            (
-                f["ema9"]
-                <
-                f["ema21"]
-                <
-                f["ema50"],
-                18,
-                "EMA trend"
-            ),
-
-            (
-                f["price"] < f["ema200"],
-                8,
-                "EMA200"
-            ),
-
-            (
-                f["macd"]
-                <
-                f["macd_signal"],
-                12,
-                "MACD"
-            ),
-
-            (
-                30 <= f["rsi"] <= 50,
-                10,
-                "RSI"
-            ),
-
-            (
-                f["adx"] >= 22
-                and
-                f["minus_di"]
-                >
-                f["plus_di"],
-                12,
-                "ADX/DI"
-            ),
-
-            (
-                f["volume_ratio"] >= 1.5,
-                14,
-                "Hacim"
-            ),
-
-            (
-                f["taker_ratio"] <= 0.48,
-                8,
-                "Satıcı baskısı"
-            ),
-
-            (
-                f["breakdown"],
-                10,
-                "Breakdown"
-            ),
-
-            (
-                -0.15
-                <=
-                f["bollinger"]
-                <=
-                0.55,
-                8,
-                "Bollinger"
-            )
-        ]
-
-    for condition, points, reason in checks:
-
-        try:
-
-            if bool(condition):
-
-                total += points
-
-                reasons.append(reason)
-
-        except:
-            pass
-
-    return (
-        min(total, 100),
-        reasons
-    )
-
-
-# =========================================================
-# SL / TP HESAPLAMA
-# =========================================================
+# ============================================================
+# TP / SL
+# ============================================================
 
 def calculate_trade_levels(
-    price,
     direction,
+    price,
+    atr,
     supports,
     resistances
 ):
+    if price <= 0 or atr <= 0:
+        return None
 
-    # Fiyatın %0.15 dibindeki seviyeleri
-    # hedef olarak kullanma
+    # Seviyenin fiyatın en az %0.15 uzağında olması
     min_distance = price * 0.0015
 
     if direction == "LONG":
 
-        below = sorted(
-            [
-                x
-                for x in supports
-                if x < price - min_distance
-            ],
-            reverse=True
-        )
+        below = [
+            x for x in supports
+            if x < price - min_distance
+        ]
 
-        above = sorted(
-            [
-                x
-                for x in resistances
-                if x > price + min_distance
-            ]
-        )
+        above = [
+            x for x in resistances
+            if x > price + min_distance
+        ]
 
-        # En az 2 direnç lazım
-        if len(above) < 2:
-            return None
-
-        # SL teknik desteğin biraz altı
-        max_sl = (
-            price * 0.98
-        )
-
+        # Teknik SL
         if below:
-
-            technical_sl = (
-                below[0] * 0.997
-            )
-
-            # %2'den fazla risk olamaz
-            sl = max(
-                technical_sl,
-                max_sl
-            )
-
+            technical_sl = max(below) - atr * 0.20
         else:
+            technical_sl = price - atr * 1.25
 
-            sl = max_sl
+        # Maksimum %2
+        max_sl = price * (
+            1 - MAX_SL_PERCENT / 100
+        )
 
-        tp1 = above[0]
-
-        # TP2 TP1'e aşırı yakın olmasın
-        tp2 = None
-
-        for resistance in above[1:]:
-
-            if (
-                resistance - tp1
-                >=
-                price * 0.003
-            ):
-
-                tp2 = resistance
-                break
-
-        if tp2 is None:
-            return None
+        sl = max(
+            technical_sl,
+            max_sl
+        )
 
         risk = price - sl
 
-        reward1 = tp1 - price
+        if risk <= 0:
+            return None
 
-        reward2 = tp2 - price
+        # TP1
+        tp1_candidates = [
+            x for x in above
+            if x >= price + risk
+        ]
+
+        if tp1_candidates:
+            tp1 = min(tp1_candidates)
+        else:
+            tp1 = price + max(
+                risk * 1.2,
+                atr * 1.5
+            )
+
+        # TP2
+        tp2_candidates = [
+            x for x in above
+            if x > tp1
+            and x >= price + risk * 2
+        ]
+
+        if tp2_candidates:
+            tp2 = min(tp2_candidates)
+        else:
+            tp2 = price + max(
+                risk * 2.2,
+                atr * 3
+            )
 
     else:
 
-        above = sorted(
-            [
-                x
-                for x in resistances
-                if x > price + min_distance
-            ]
-        )
+        above = [
+            x for x in resistances
+            if x > price + min_distance
+        ]
 
-        below = sorted(
-            [
-                x
-                for x in supports
-                if x < price - min_distance
-            ],
-            reverse=True
-        )
-
-        # En az 2 destek lazım
-        if len(below) < 2:
-            return None
-
-        max_sl = (
-            price * 1.02
-        )
+        below = [
+            x for x in supports
+            if x < price - min_distance
+        ]
 
         if above:
-
-            technical_sl = (
-                above[0] * 1.003
-            )
-
-            # %2'den fazla risk olamaz
-            sl = min(
-                technical_sl,
-                max_sl
-            )
-
+            technical_sl = min(above) + atr * 0.20
         else:
+            technical_sl = price + atr * 1.25
 
-            sl = max_sl
+        max_sl = price * (
+            1 + MAX_SL_PERCENT / 100
+        )
 
-        tp1 = below[0]
-
-        tp2 = None
-
-        for support in below[1:]:
-
-            if (
-                tp1 - support
-                >=
-                price * 0.003
-            ):
-
-                tp2 = support
-                break
-
-        if tp2 is None:
-            return None
+        sl = min(
+            technical_sl,
+            max_sl
+        )
 
         risk = sl - price
 
-        reward1 = price - tp1
+        if risk <= 0:
+            return None
 
-        reward2 = price - tp2
+        tp1_candidates = [
+            x for x in below
+            if x <= price - risk
+        ]
 
-    if risk <= 0:
+        if tp1_candidates:
+            tp1 = max(tp1_candidates)
+        else:
+            tp1 = price - max(
+                risk * 1.2,
+                atr * 1.5
+            )
+
+        tp2_candidates = [
+            x for x in below
+            if x < tp1
+            and x <= price - risk * 2
+        ]
+
+        if tp2_candidates:
+            tp2 = max(tp2_candidates)
+        else:
+            tp2 = price - max(
+                risk * 2.2,
+                atr * 3
+            )
+
+    if sl <= 0 or tp1 <= 0 or tp2 <= 0:
         return None
 
-    rr1 = reward1 / risk
-
-    rr2 = reward2 / risk
-
-    # Kötü risk/getiri ise sinyal verme
-    if rr1 < MIN_TP1_RR:
-        return None
-
-    if rr2 < MIN_TP2_RR:
-        return None
-
-    tp1_percent = (
-        reward1
-        /
-        price
-        *
-        100
-    )
-
-    tp2_percent = (
-        reward2
-        /
-        price
-        *
-        100
-    )
-
-    sl_percent = (
-        risk
-        /
-        price
-        *
-        100
-    )
+    rr1 = abs(tp1 - price) / abs(price - sl)
+    rr2 = abs(tp2 - price) / abs(price - sl)
 
     return {
         "sl": sl,
         "tp1": tp1,
         "tp2": tp2,
-
-        "sl_percent": sl_percent,
-        "tp1_percent": tp1_percent,
-        "tp2_percent": tp2_percent,
-
         "rr1": rr1,
         "rr2": rr2
     }
 
+# ============================================================
+# HABER RSS
+# ============================================================
 
-# =========================================================
-# COIN ANALIZI
-# =========================================================
+def parse_date(text):
+    if not text:
+        return None
 
-def analyze(symbol, btc):
+    try:
+        dt = parsedate_to_datetime(text)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(
+                tzinfo=timezone.utc
+            )
+
+        return dt.astimezone(
+            timezone.utc
+        )
+
+    except:
+        return None
+
+
+def clean_text(text):
+    if not text:
+        return ""
+
+    text = text.replace(
+        "<![CDATA[",
+        ""
+    ).replace(
+        "]]>",
+        ""
+    )
+
+    return " ".join(
+        text.split()
+    )
+
+
+def parse_rss(source, xml_text):
+    result = []
+
+    try:
+        root = ET.fromstring(xml_text)
+
+        # RSS item
+        for item in root.findall(".//item"):
+            title = clean_text(
+                item.findtext("title")
+            )
+
+            link = clean_text(
+                item.findtext("link")
+            )
+
+            pub = (
+                item.findtext("pubDate")
+                or item.findtext("date")
+            )
+
+            dt = parse_date(pub)
+
+            result.append({
+                "source": source,
+                "title": title,
+                "link": link,
+                "date": dt
+            })
+
+        # Atom fallback
+        if not result:
+            ns = {
+                "a":
+                "http://www.w3.org/2005/Atom"
+            }
+
+            for entry in root.findall(
+                ".//a:entry",
+                ns
+            ):
+                title = clean_text(
+                    entry.findtext(
+                        "a:title",
+                        namespaces=ns
+                    )
+                )
+
+                link_el = entry.find(
+                    "a:link",
+                    ns
+                )
+
+                link = ""
+
+                if link_el is not None:
+                    link = link_el.attrib.get(
+                        "href",
+                        ""
+                    )
+
+                pub = (
+                    entry.findtext(
+                        "a:published",
+                        namespaces=ns
+                    )
+                    or entry.findtext(
+                        "a:updated",
+                        namespaces=ns
+                    )
+                )
+
+                dt = None
+
+                try:
+                    if pub:
+                        dt = datetime.fromisoformat(
+                            pub.replace(
+                                "Z",
+                                "+00:00"
+                            )
+                        )
+                except:
+                    pass
+
+                result.append({
+                    "source": source,
+                    "title": title,
+                    "link": link,
+                    "date": dt
+                })
+
+    except Exception as e:
+        print(
+            f"RSS parse hata {source}:",
+            e
+        )
+
+    return result
+
+
+def update_news():
+    global news_cache
+    global news_last_update
+
+    now = time.time()
+
+    if (
+        news_cache
+        and now - news_last_update
+        < NEWS_REFRESH_SECONDS
+    ):
+        return
+
+    all_news = []
+
+    for source, url in NEWS_FEEDS.items():
+        xml = get_text(url)
+
+        if not xml:
+            continue
+
+        articles = parse_rss(
+            source,
+            xml
+        )
+
+        all_news.extend(articles)
+
+    # Aynı başlıkları temizle
+    unique = {}
+    now_dt = datetime.now(
+        timezone.utc
+    )
+
+    for article in all_news:
+        title = article["title"].strip()
+
+        if not title:
+            continue
+
+        key = (
+            title.lower()
+            .replace("bitcoin", "btc")
+            .replace("ethereum", "eth")
+        )
+
+        dt = article.get("date")
+
+        if dt:
+            age = (
+                now_dt - dt
+            ).total_seconds() / 3600
+
+            # 24 saatten eski haberleri cache'e alma
+            if age > 24:
+                continue
+
+        if key not in unique:
+            unique[key] = article
+
+    with news_lock:
+        news_cache = list(
+            unique.values()
+        )
+
+        news_last_update = now
+
+    print(
+        f"Haber havuzu güncellendi: "
+        f"{len(news_cache)} haber"
+    )
+
+# ============================================================
+# HABER - COIN EŞLEŞTİRME
+# ============================================================
+
+def get_coin_terms(base):
+    base = base.upper()
+
+    terms = COIN_NAMES.get(
+        base,
+        []
+    ).copy()
+
+    # BTC, ETH gibi semboller için
+    # kısa sembollerde yanlış eşleşme olabilir.
+    if len(base) >= 4:
+        terms.append(base.lower())
+
+    return list(set(terms))
+
+
+def article_matches_coin(article, base):
+    title = article["title"].lower()
+
+    terms = get_coin_terms(base)
+
+    for term in terms:
+        # Çok kısa sembolleri kelime olarak kontrol et
+        if len(term) <= 3:
+            words = (
+                title.replace("-", " ")
+                .replace("/", " ")
+                .replace(",", " ")
+                .replace(".", " ")
+                .split()
+            )
+
+            if term in words:
+                return True
+
+        elif term in title:
+            return True
+
+    return False
+
+
+def news_importance(title):
+    t = title.lower()
+
+    strong = sum(
+        1
+        for word in STRONG_NEWS_WORDS
+        if word in t
+    )
+
+    medium = sum(
+        1
+        for word in MEDIUM_NEWS_WORDS
+        if word in t
+    )
+
+    if strong >= 2:
+        return 10
+
+    if strong == 1:
+        return 7
+
+    if medium >= 2:
+        return 5
+
+    if medium == 1:
+        return 3
+
+    return 2
+
+
+def news_score(base):
+    now = datetime.now(
+        timezone.utc
+    )
+
+    matches = []
+
+    with news_lock:
+        articles = list(news_cache)
+
+    for article in articles:
+
+        if not article_matches_coin(
+            article,
+            base
+        ):
+            continue
+
+        dt = article.get("date")
+
+        if dt:
+            age = (
+                now - dt
+            ).total_seconds() / 3600
+
+            if age > NEWS_MAX_AGE_HOURS:
+                continue
+
+        else:
+            age = None
+
+        importance = news_importance(
+            article["title"]
+        )
+
+        # Çok yeni habere biraz öncelik
+        if age is not None:
+            if age <= 2:
+                importance = min(
+                    10,
+                    importance + 2
+                )
+
+            elif age <= 6:
+                importance = min(
+                    10,
+                    importance + 1
+                )
+
+        matches.append({
+            **article,
+            "age": age,
+            "importance": importance
+        })
+
+    if not matches:
+        return 0, None
+
+    matches.sort(
+        key=lambda x: x["importance"],
+        reverse=True
+    )
+
+    best = matches[0]
+
+    # Haber maksimum +10
+    score = min(
+        10,
+        best["importance"]
+    )
+
+    return score, best
+
+# ============================================================
+# TEKNİK SKOR
+# ============================================================
+
+def technical_score(df15, df1h, direction):
+    a = df15.iloc[-2]
+    b = df1h.iloc[-2]
+
+    score = 0
+    reasons = []
+
+    breakout, retest = breakout_retest(
+        df15,
+        direction
+    )
+
+    if direction == "LONG":
+
+        if (
+            a["ema9"] > a["ema21"]
+            > a["ema50"]
+        ):
+            score += 16
+            reasons.append(
+                "15m EMA trend yukarı"
+            )
+
+        if a["close"] > a["ema200"]:
+            score += 7
+            reasons.append(
+                "15m EMA200 üstü"
+            )
+
+        if (
+            b["ema9"] > b["ema21"]
+            > b["ema50"]
+        ):
+            score += 10
+            reasons.append(
+                "1h trend yukarı"
+            )
+
+        if b["close"] > b["ema200"]:
+            score += 5
+
+        if a["macd"] > a["macd_signal"]:
+            score += 9
+            reasons.append(
+                "MACD pozitif"
+            )
+
+        if 48 <= a["rsi"] <= 70:
+            score += 8
+            reasons.append(
+                f"RSI {a['rsi']:.1f}"
+            )
+
+        if (
+            a["adx"] >= 20
+            and a["plus_di"] > a["minus_di"]
+        ):
+            score += 10
+            reasons.append(
+                f"ADX {a['adx']:.1f}"
+            )
+
+        if a["vol_ratio"] >= 1.30:
+            score += 10
+            reasons.append(
+                f"Hacim {a['vol_ratio']:.2f}x"
+            )
+
+        if a["taker_ratio"] >= 0.52:
+            score += 5
+            reasons.append(
+                "Alıcı baskısı"
+            )
+
+        if breakout:
+            score += 10
+            reasons.append(
+                "Breakout"
+            )
+
+        if retest:
+            score += 10
+            reasons.append(
+                "Breakout + retest"
+            )
+
+    else:
+
+        if (
+            a["ema9"] < a["ema21"]
+            < a["ema50"]
+        ):
+            score += 16
+            reasons.append(
+                "15m EMA trend aşağı"
+            )
+
+        if a["close"] < a["ema200"]:
+            score += 7
+            reasons.append(
+                "15m EMA200 altı"
+            )
+
+        if (
+            b["ema9"] < b["ema21"]
+            < b["ema50"]
+        ):
+            score += 10
+            reasons.append(
+                "1h trend aşağı"
+            )
+
+        if b["close"] < b["ema200"]:
+            score += 5
+
+        if a["macd"] < a["macd_signal"]:
+            score += 9
+            reasons.append(
+                "MACD negatif"
+            )
+
+        if 30 <= a["rsi"] <= 52:
+            score += 8
+            reasons.append(
+                f"RSI {a['rsi']:.1f}"
+            )
+
+        if (
+            a["adx"] >= 20
+            and a["minus_di"] > a["plus_di"]
+        ):
+            score += 10
+            reasons.append(
+                f"ADX {a['adx']:.1f}"
+            )
+
+        if a["vol_ratio"] >= 1.30:
+            score += 10
+            reasons.append(
+                f"Hacim {a['vol_ratio']:.2f}x"
+            )
+
+        if a["taker_ratio"] <= 0.48:
+            score += 5
+            reasons.append(
+                "Satıcı baskısı"
+            )
+
+        if breakout:
+            score += 10
+            reasons.append(
+                "Breakdown"
+            )
+
+        if retest:
+            score += 10
+            reasons.append(
+                "Breakdown + retest"
+            )
+
+    # Teknik skor max 90'a normalize
+    score = min(
+        score,
+        90
+    )
+
+    return score, reasons
+
+# ============================================================
+# BTC FİLTRESİ
+# ============================================================
+
+def btc_state():
+    df = klines(
+        "BTCUSDT",
+        "15m",
+        100
+    )
+
+    if df is None:
+        return "NEUTRAL"
+
+    df = features(df)
+
+    r = df.iloc[-2]
+
+    if (
+        r["ema9"] > r["ema21"]
+        and r["macd"] > r["macd_signal"]
+    ):
+        return "LONG"
+
+    if (
+        r["ema9"] < r["ema21"]
+        and r["macd"] < r["macd_signal"]
+    ):
+        return "SHORT"
+
+    return "NEUTRAL"
+
+# ============================================================
+# ANALİZ
+# ============================================================
+
+def analyze(item, btc):
+    symbol = item["symbol"]
+    base = item["base"]
 
     df15 = klines(
         symbol,
-        "15m"
+        "15m",
+        220
     )
+
+    if df15 is None:
+        return None
+
+    # Ufak gecikme rate limit için
+    time.sleep(0.08)
 
     df1h = klines(
         symbol,
-        "1h"
+        "1h",
+        220
     )
 
-    f15 = features(df15)
+    if df1h is None:
+        return None
 
-    f1h = features(df1h)
+    try:
+        f15 = features(df15)
+        f1h = features(df1h)
 
-    supports, resistances = support_resistance(
-        df15,
-        df1h
-    )
+        row = f15.iloc[-2]
 
-    output = []
+        price = float(row["close"])
+        atr = float(row["atr"])
 
-    for direction in [
-        "LONG",
-        "SHORT"
-    ]:
+        if (
+            math.isnan(price)
+            or math.isnan(atr)
+            or atr <= 0
+        ):
+            return None
 
-        score15, reasons15 = score(
+        long_score, long_reasons = technical_score(
             f15,
-            direction
-        )
-
-        score1h, reasons1h = score(
             f1h,
-            direction
+            "LONG"
         )
 
-        if direction == "LONG":
+        short_score, short_reasons = technical_score(
+            f15,
+            f1h,
+            "SHORT"
+        )
 
-            btc_ok = (
-                btc["ema9"]
-                >=
-                btc["ema21"]
-            )
+        if long_score >= short_score:
+            direction = "LONG"
+            tech_score = long_score
+            reasons = long_reasons
 
         else:
+            direction = "SHORT"
+            tech_score = short_score
+            reasons = short_reasons
 
-            btc_ok = (
-                btc["ema9"]
-                <=
-                btc["ema21"]
+        # Teknik taraf çok zayıfsa
+        # haberle zorla işlem üretme
+        if tech_score < MIN_TECH_SCORE:
+            return None
+
+        # BTC aynı yöndeyse +3 teknik destek
+        btc_bonus = 0
+
+        if btc == direction:
+            btc_bonus = 3
+            reasons.append(
+                f"BTC {direction} uyumlu"
             )
 
-        final_score = (
-            0.58 * score15
-            +
-            0.32 * score1h
-            +
-            (10 if btc_ok else 0)
+        elif btc != "NEUTRAL":
+            reasons.append(
+                f"BTC ters yönde ({btc})"
+            )
+
+        # Haber
+        nscore, news = news_score(base)
+
+        total = min(
+            100,
+            tech_score
+            + btc_bonus
+            + nscore
         )
 
-        final_score = min(
-            round(final_score, 1),
-            100
-        )
+        if total < MIN_SCORE:
+            return None
 
-        if final_score < MIN_SCORE:
-            continue
-
-        price = float(
-            f15["price"]
+        supports, resistances = support_resistance(
+            f15,
+            f1h
         )
 
         levels = calculate_trade_levels(
-            price,
             direction,
+            price,
+            atr,
             supports,
             resistances
         )
 
-        # Mantıklı destek/direnç hedefi yoksa
-        # sinyal gönderme
-        if levels is None:
-            continue
+        # Seviyeler bulunamazsa bile
+        # ATR fallback olduğu için normalde
+        # buraya düşmez.
+        if not levels:
+            return None
 
-        reasons = sorted(
-            set(
-                reasons15
-                +
-                reasons1h
-            )
-        )
-
-        output.append({
-
+        return {
             "symbol": symbol,
-
+            "base": base,
             "direction": direction,
-
-            "score": final_score,
-
+            "score": total,
+            "tech_score": tech_score,
+            "btc_bonus": btc_bonus,
+            "news_score": nscore,
             "price": price,
-
             "sl": levels["sl"],
-
             "tp1": levels["tp1"],
-
             "tp2": levels["tp2"],
+            "rr1": levels["rr1"],
+            "rr2": levels["rr2"],
+            "rsi": float(row["rsi"]),
+            "adx": float(row["adx"]),
+            "vol_ratio": float(
+                row["vol_ratio"]
+            ),
+            "reasons": reasons,
+            "news": news,
+            "volume24h": item["volume"]
+        }
 
-            "sl_percent":
-                levels["sl_percent"],
-
-            "tp1_percent":
-                levels["tp1_percent"],
-
-            "tp2_percent":
-                levels["tp2_percent"],
-
-            "rr1":
-                levels["rr1"],
-
-            "rr2":
-                levels["rr2"],
-
-            "rsi":
-                f15["rsi"],
-
-            "volume_ratio":
-                f15["volume_ratio"],
-
-            "adx":
-                f15["adx"],
-
-            "reasons":
-                reasons
-        })
-
-    return output
-
-
-# =========================================================
-# TELEGRAM
-# =========================================================
-
-def telegram(message, chat_id=None):
-
-    target = (
-        chat_id
-        if chat_id is not None
-        else CHAT
-    )
-
-    if not TOKEN or not target:
-
+    except Exception as e:
         print(
-            "Telegram ayarlari eksik",
-            flush=True
+            f"{symbol} analiz hata:",
+            e
         )
 
-        return
+        return None
 
-    response = requests.post(
+# ============================================================
+# FİYAT FORMAT
+# ============================================================
 
-        f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+def fmt_price(p):
+    if p >= 1000:
+        return f"{p:.2f}"
 
-        json={
-            "chat_id": target,
-            "text": message
-        },
+    if p >= 100:
+        return f"{p:.3f}"
 
-        timeout=20
+    if p >= 1:
+        return f"{p:.4f}"
+
+    if p >= 0.1:
+        return f"{p:.5f}"
+
+    if p >= 0.01:
+        return f"{p:.6f}"
+
+    return f"{p:.8f}"
+
+# ============================================================
+# SİNYAL MESAJI
+# ============================================================
+
+def signal_message(x):
+    direction_icon = (
+        "🟢"
+        if x["direction"] == "LONG"
+        else "🔴"
     )
 
-    response.raise_for_status()
-
-
-# =========================================================
-# UPTIME
-# =========================================================
-
-def uptime():
-
-    seconds = int(
-        time.time()
-        -
-        bot_started
+    risk_pct = (
+        abs(x["price"] - x["sl"])
+        / x["price"]
+        * 100
     )
 
-    hours = seconds // 3600
-
-    minutes = (
-        seconds % 3600
-    ) // 60
-
-    return (
-        f"{hours} saat "
-        f"{minutes} dakika"
+    tp1_pct = (
+        abs(x["tp1"] - x["price"])
+        / x["price"]
+        * 100
     )
 
+    tp2_pct = (
+        abs(x["tp2"] - x["price"])
+        / x["price"]
+        * 100
+    )
 
-# =========================================================
-# DURUM
-# =========================================================
+    reasons = "\n".join(
+        f"• {r}"
+        for r in x["reasons"][:7]
+    )
 
-def status(chat_id):
+    msg = (
+        f"🚨 RADAR V5 SİNYALİ\n\n"
+        f"{direction_icon} "
+        f"{x['symbol']} "
+        f"{x['direction']}\n\n"
 
-    if scan_running:
+        f"⭐ TOPLAM: "
+        f"{x['score']:.0f}/100\n"
 
-        state = "🔎 Tarama yapılıyor"
+        f"📊 Teknik: "
+        f"{x['tech_score']:.0f}/90\n"
+
+        f"📰 Haber: "
+        f"+{x['news_score']:.0f}\n\n"
+
+        f"💰 Giriş: "
+        f"{fmt_price(x['price'])}\n"
+
+        f"🛑 SL: "
+        f"{fmt_price(x['sl'])} "
+        f"({risk_pct:.2f}%)\n"
+
+        f"🎯 TP1: "
+        f"{fmt_price(x['tp1'])} "
+        f"({tp1_pct:.2f}%) "
+        f"R:R {x['rr1']:.2f}\n"
+
+        f"🎯 TP2: "
+        f"{fmt_price(x['tp2'])} "
+        f"({tp2_pct:.2f}%) "
+        f"R:R {x['rr2']:.2f}\n\n"
+
+        f"📈 RSI: "
+        f"{x['rsi']:.1f}\n"
+
+        f"⚡ Hacim: "
+        f"{x['vol_ratio']:.2f}x\n"
+
+        f"💪 ADX: "
+        f"{x['adx']:.1f}\n"
+
+        f"💵 24s Futures hacim: "
+        f"${x['volume24h']/1_000_000:.1f}M\n\n"
+
+        f"🔎 Neden:\n"
+        f"{reasons}"
+    )
+
+    news = x.get("news")
+
+    if news:
+        age_text = "zaman bilinmiyor"
+
+        if news["age"] is not None:
+            if news["age"] < 1:
+                age_text = (
+                    f"{int(news['age'] * 60)} dk önce"
+                )
+            else:
+                age_text = (
+                    f"{news['age']:.1f} saat önce"
+                )
+
+        msg += (
+            f"\n\n📰 KATALİZÖR\n"
+            f"{news['source']} | "
+            f"{age_text}\n"
+            f"{news['title']}"
+        )
+
+        if news.get("link"):
+            msg += (
+                f"\n{news['link']}"
+            )
 
     else:
-
-        state = "🟢 Çalışıyor"
-
-    if last_scan_time:
-
-        ago = int(
-            time.time()
-            -
-            last_scan_time
+        msg += (
+            "\n\n📰 Coin için güçlü yeni "
+            "haber katalizörü bulunmadı."
         )
 
-        last = (
-            f"{ago} saniye önce"
-        )
-
-    else:
-
-        last = "Henüz tamamlanmadı"
-
-    if last_scan_duration is not None:
-
-        duration = (
-            f"{last_scan_duration:.1f} saniye"
-        )
-
-    else:
-
-        duration = "-"
-
-    message = (
-
-        "📊 COIN RADAR DURUMU\n\n"
-
-        f"Durum: {state}\n"
-
-        f"Çalışma süresi: "
-        f"{uptime()}\n\n"
-
-        f"Minimum skor: "
-        f"{MIN_SCORE}/100\n"
-
-        "Minimum 24h hacim: $10M\n"
-
-        "Analiz: 15m + 1h\n"
-
-        "Yön: LONG + SHORT\n\n"
-
-        "🛑 SL: Teknik / maksimum %2\n"
-
-        "🎯 TP1: Destek/direnç\n"
-
-        "🚀 TP2: Destek/direnç\n\n"
-
-        "Minimum R:R:\n"
-
-        f"TP1: {MIN_TP1_RR:.1f}R\n"
-
-        f"TP2: {MIN_TP2_RR:.1f}R\n\n"
-
-        f"Son tarama: {last}\n"
-
-        f"Tarama süresi: {duration}\n"
-
-        f"Taranan coin: "
-        f"{last_scan_count}\n"
-
-        f"Yeni sinyal: "
-        f"{last_signal_count}"
+    msg += (
+        "\n\n⚠️ Radar skoru gerçekleşmiş "
+        "kazanma oranı değildir."
     )
 
-    telegram(
-        message,
-        chat_id
+    return msg
+
+# ============================================================
+# COOLDOWN
+# ============================================================
+
+def can_alert(symbol, direction):
+    key = (
+        symbol,
+        direction
     )
 
+    last = alerts.get(
+        key,
+        0
+    )
 
-# =========================================================
-# TARAMA
-# =========================================================
+    if (
+        time.time() - last
+        < ALERT_COOLDOWN
+    ):
+        return False
 
-def scan_market(manual_chat=None):
+    alerts[key] = time.time()
 
-    global scan_running
+    return True
+
+# ============================================================
+# MARKET TARAMA
+# ============================================================
+
+def scan_market(manual=False):
     global last_scan_time
     global last_scan_duration
     global last_scan_count
@@ -1255,289 +1724,262 @@ def scan_market(manual_chat=None):
     if not scan_lock.acquire(
         blocking=False
     ):
-
-        if manual_chat:
-
+        if manual:
             telegram(
-                "⏳ Tarama zaten devam ediyor.",
-                manual_chat
+                "⏳ Tarama zaten devam ediyor."
             )
-
         return
-
-    scan_running = True
 
     started = time.time()
 
     try:
+        update_news()
 
-        coin_list = symbols()
+        coins = get_symbols()
+
+        last_scan_count = len(coins)
 
         print(
-            f"10M+ hacimli "
-            f"{len(coin_list)} coin bulundu.",
-            flush=True
+            f"Taranacak coin: {len(coins)}"
         )
 
-        if manual_chat:
+        if not coins:
+            print("Coin listesi alınamadı.")
+            return
 
-            telegram(
-                "🔎 Tarama başladı.\n\n"
-                f"{len(coin_list)} coin "
-                "analiz ediliyor.",
-                manual_chat
-            )
+        btc = btc_state()
 
-        # BTC SADECE 1 KEZ CEKILIR
-        btc = features(
-            klines(
-                "BTCUSDT",
-                "15m"
-            )
+        print(
+            f"BTC durum: {btc}"
         )
 
-        signals = 0
+        signals = []
 
-        processed = 0
+        for index, item in enumerate(
+            coins,
+            start=1
+        ):
+            symbol = item["symbol"]
 
-        for symbol, volume24 in coin_list:
+            print(
+                f"[{index}/{len(coins)}] "
+                f"{symbol}"
+            )
 
             try:
-
-                results = analyze(
-                    symbol,
+                result = analyze(
+                    item,
                     btc
                 )
 
-                processed += 1
+                if result:
+                    signals.append(
+                        result
+                    )
 
-                for result in results:
-
-                    key = (
+                    if can_alert(
                         result["symbol"],
                         result["direction"]
-                    )
-
-                    now = time.time()
-
-                    if (
-                        now
-                        -
-                        last_alert.get(
-                            key,
-                            0
-                        )
-                        <
-                        ALERT_COOLDOWN
                     ):
-                        continue
+                        telegram(
+                            signal_message(result)
+                        )
 
-                    if result["direction"] == "LONG":
-
-                        icon = "🟢"
-
-                        sl_sign = "-"
-                        tp_sign = "+"
-
-                    else:
-
-                        icon = "🔴"
-
-                        sl_sign = "+"
-                        tp_sign = "-"
-
-                    volume_m = (
-                        volume24
-                        /
-                        1_000_000
-                    )
-
-                    message = (
-
-                        f"🔥 {result['symbol']}\n\n"
-
-                        f"{icon} "
-                        f"{result['direction']}\n"
-
-                        f"⭐ Radar skoru: "
-                        f"{result['score']}/100\n\n"
-
-                        f"💰 Giriş: "
-                        f"{result['price']:.8g}\n\n"
-
-                        f"🛑 SL: "
-                        f"{result['sl']:.8g} "
-                        f"({sl_sign}"
-                        f"%{result['sl_percent']:.2f})\n\n"
-
-                        f"🎯 TP1: "
-                        f"{result['tp1']:.8g} "
-                        f"({tp_sign}"
-                        f"%{result['tp1_percent']:.2f})\n"
-
-                        f"R:R TP1: "
-                        f"1:{result['rr1']:.2f}\n\n"
-
-                        f"🚀 TP2: "
-                        f"{result['tp2']:.8g} "
-                        f"({tp_sign}"
-                        f"%{result['tp2_percent']:.2f})\n"
-
-                        f"R:R TP2: "
-                        f"1:{result['rr2']:.2f}\n\n"
-
-                        f"24h Futures hacmi: "
-                        f"${volume_m:.1f}M\n"
-
-                        f"RSI: "
-                        f"{result['rsi']:.1f}\n"
-
-                        f"Hacim oranı: "
-                        f"x{result['volume_ratio']:.2f}\n"
-
-                        f"ADX: "
-                        f"{result['adx']:.1f}\n\n"
-
-                        "Onaylar:\n"
-
-                        f"{', '.join(result['reasons'])}\n\n"
-
-                        "TP seviyeleri 15m + 1h "
-                        "destek/dirençlerden hesaplandı.\n"
-
-                        "⚠️ Radar skoru kazanma "
-                        "olasılığı değildir."
-                    )
-
-                    telegram(message)
-
-                    last_alert[key] = now
-
-                    signals += 1
+                        print(
+                            "SİNYAL:",
+                            result["symbol"],
+                            result["direction"],
+                            result["score"]
+                        )
 
             except Exception as e:
-
                 print(
-                    f"{symbol} hata: {e}",
-                    flush=True
+                    symbol,
+                    "tarama hata:",
+                    e
                 )
 
-        duration = (
-            time.time()
-            -
-            started
+            # Binance'e yük bindirmemek için
+            time.sleep(0.12)
+
+        # En yüksek skorlular
+        signals.sort(
+            key=lambda x: x["score"],
+            reverse=True
         )
 
-        last_scan_time = time.time()
-
-        last_scan_duration = duration
-
-        last_scan_count = processed
-
-        last_signal_count = signals
-
-        print(
-            f"Tarama tamamlandi | "
-            f"{processed} coin | "
-            f"{signals} sinyal | "
-            f"{duration:.1f} saniye",
-            flush=True
+        last_signal_count = len(
+            signals
         )
 
-        if manual_chat:
+        if manual:
+            if signals:
+                top = signals[:5]
 
-            telegram(
-                "✅ Tarama tamamlandı.\n\n"
-                f"Taranan: {processed}\n"
-                f"Yeni sinyal: {signals}\n"
-                f"Süre: {duration:.1f} saniye",
-                manual_chat
-            )
+                text = (
+                    "🔍 MANUEL TARAMA BİTTİ\n\n"
+                )
 
-    except Exception as e:
+                for s in top:
+                    text += (
+                        f"{s['symbol']} "
+                        f"{s['direction']} "
+                        f"{s['score']:.0f}/100\n"
+                    )
 
-        print(
-            f"Genel tarama hatasi: {e}",
-            flush=True
-        )
+                telegram(text)
 
-        if manual_chat:
-
-            telegram(
-                f"❌ Tarama hatası:\n{e}",
-                manual_chat
-            )
+            else:
+                telegram(
+                    "🔍 Tarama bitti.\n"
+                    "Şu anda 80+ uygun "
+                    "sinyal bulunamadı."
+                )
 
     finally:
+        last_scan_time = time.time()
 
-        scan_running = False
+        last_scan_duration = (
+            time.time() - started
+        )
 
         scan_lock.release()
 
-
-# =========================================================
-# OTOMATIK TARAMA
-# =========================================================
-
-def radar_loop():
-
-    while True:
-
-        scan_market()
-
-        time.sleep(
-            INTERVAL
+        print(
+            f"Tarama tamamlandı: "
+            f"{last_scan_duration:.1f} sn"
         )
 
+# ============================================================
+# DURUM
+# ============================================================
 
-# =========================================================
-# TELEGRAM KOMUTLARI
-# =========================================================
+def status():
+    if last_scan_time:
+        last_scan = datetime.fromtimestamp(
+            last_scan_time
+        ).strftime(
+            "%H:%M:%S"
+        )
+    else:
+        last_scan = "Henüz yok"
 
-def telegram_commands():
+    with news_lock:
+        news_count = len(
+            news_cache
+        )
 
-    global telegram_offset
+    return (
+        "🤖 COIN RADAR V5\n\n"
 
-    print(
-        "Telegram komut sistemi aktif",
-        flush=True
+        f"🟢 Durum: Çalışıyor\n"
+        f"⏱ Uptime: {uptime()}\n\n"
+
+        f"⭐ Minimum skor: {MIN_SCORE:.0f}\n"
+        f"📊 Min teknik: {MIN_TECH_SCORE:.0f}\n"
+
+        f"💵 Min hacim: "
+        f"${MIN_VOLUME/1_000_000:.0f}M\n"
+
+        f"🔄 Tarama aralığı: "
+        f"{SCAN_INTERVAL} sn\n\n"
+
+        f"🕒 Son tarama: {last_scan}\n"
+
+        f"⏳ Tarama süresi: "
+        f"{last_scan_duration:.1f} sn\n"
+
+        f"🪙 Taranan: "
+        f"{last_scan_count}\n"
+
+        f"🚨 Uygun sinyal: "
+        f"{last_signal_count}\n"
+
+        f"📰 Haber havuzu: "
+        f"{news_count}\n\n"
+
+        "📈 Timeframe: 15m + 1h\n"
+        "🎯 TP: Destek/direnç + ATR\n"
+        "🛑 SL: Teknik + ATR, max %2\n"
+        "📰 Haber bonusu: max +10"
     )
 
+# ============================================================
+# TELEGRAM KOMUTLARI
+# ============================================================
+
+def telegram_commands():
+    if not TOKEN:
+        print(
+            "Telegram token yok."
+        )
+        return
+
+    offset = None
+
     while True:
-
         try:
+            params = {
+                "timeout": 25
+            }
 
-            response = requests.get(
+            if offset is not None:
+                params["offset"] = offset
 
-                f"https://api.telegram.org/bot{TOKEN}/getUpdates",
+            url = (
+                f"https://api.telegram.org/"
+                f"bot{TOKEN}/getUpdates"
+            )
 
-                params={
-                    "timeout": 25,
-                    "offset": telegram_offset
-                },
-
+            r = session.get(
+                url,
+                params=params,
                 timeout=35
             )
 
-            response.raise_for_status()
+            if r.status_code == 409:
+                print(
+                    "Telegram 409: "
+                    "Bu bot tokenini başka "
+                    "bir süreç de kullanıyor."
+                )
 
-            updates = response.json()
+                time.sleep(10)
+                continue
 
-            for update in updates.get(
+            data = r.json()
+
+            if not data.get("ok"):
+                time.sleep(3)
+                continue
+
+            for update in data.get(
                 "result",
                 []
             ):
-
-                telegram_offset = (
+                offset = (
                     update["update_id"]
-                    +
-                    1
+                    + 1
                 )
 
                 message = update.get(
                     "message",
                     {}
                 )
+
+                chat_id = str(
+                    message.get(
+                        "chat",
+                        {}
+                    ).get(
+                        "id",
+                        ""
+                    )
+                )
+
+                # Sadece kendi chat ID
+                if CHAT and chat_id != str(CHAT):
+                    continue
 
                 text = (
                     message.get(
@@ -1548,139 +1990,85 @@ def telegram_commands():
                     .lower()
                 )
 
-                chat_id = (
-                    message.get(
-                        "chat",
-                        {}
-                    ).get("id")
-                )
-
-                if not chat_id:
-                    continue
-
-                if (
-                    CHAT
-                    and
-                    str(chat_id)
-                    !=
-                    str(CHAT)
-                ):
-                    continue
-
-                if text in [
-                    "/start",
-                    "/yardim",
-                    "/help"
-                ]:
-
+                if text == "/durum":
                     telegram(
-
-                        "🤖 COIN RADAR\n\n"
-
-                        "/durum - Bot durumu\n"
-
-                        "/tara - Hemen tara\n"
-
-                        "/yardim - Yardım\n\n"
-
-                        "Filtreler:\n"
-
-                        "24h hacim ≥ $10M\n"
-
-                        f"Skor ≥ {MIN_SCORE}\n"
-
-                        "15m + 1h\n"
-
-                        "LONG + SHORT\n\n"
-
-                        "SL: Teknik, max %2\n"
-
-                        "TP1: Destek/direnç\n"
-
-                        "TP2: Destek/direnç",
-
-                        chat_id
-                    )
-
-                elif text == "/durum":
-
-                    status(
-                        chat_id
+                        status()
                     )
 
                 elif text == "/tara":
+                    telegram(
+                        "🔍 Manuel tarama başlatıldı..."
+                    )
 
-                    if scan_running:
+                    threading.Thread(
+                        target=scan_market,
+                        kwargs={
+                            "manual": True
+                        },
+                        daemon=True
+                    ).start()
 
-                        telegram(
-                            "⏳ Şu anda tarama "
-                            "devam ediyor.",
-                            chat_id
-                        )
-
-                    else:
-
-                        threading.Thread(
-                            target=scan_market,
-                            args=(chat_id,),
-                            daemon=True
-                        ).start()
+                elif text in [
+                    "/start",
+                    "/yardim"
+                ]:
+                    telegram(
+                        "🤖 COIN RADAR V5\n\n"
+                        "/durum - Bot durumu\n"
+                        "/tara - Manuel tarama\n"
+                        "/yardim - Komutlar\n\n"
+                        "Minimum sinyal: 80/100\n"
+                        "Teknik + Haber + BTC filtresi"
+                    )
 
         except Exception as e:
-
             print(
-                f"Telegram komut hatasi: {e}",
-                flush=True
+                "Telegram polling hata:",
+                e
             )
 
             time.sleep(5)
 
+# ============================================================
+# RADAR LOOP
+# ============================================================
 
-# =========================================================
-# BASLAT
-# =========================================================
+def radar_loop():
+    while True:
+        try:
+            scan_market()
+
+        except Exception as e:
+            print(
+                "Radar loop hata:",
+                e
+            )
+
+        time.sleep(
+            SCAN_INTERVAL
+        )
+
+# ============================================================
+# RUN
+# ============================================================
 
 def run():
-
     print(
-        "COIN RADAR BASLADI",
-        flush=True
+        "Coin Radar V5 başlıyor..."
     )
 
-    try:
+    update_news()
 
-        telegram(
-
-            "🟢 COIN RADAR AKTİF\n\n"
-
-            "24h Futures hacmi ≥ $10M\n"
-
-            f"Minimum skor: "
-            f"{MIN_SCORE}/100\n"
-
-            "Analiz: 15m + 1h\n"
-
-            "LONG + SHORT\n\n"
-
-            "🛑 SL: Teknik, maksimum %2\n"
-
-            "🎯 TP1: Destek/direnç\n"
-
-            "🚀 TP2: Destek/direnç\n\n"
-
-            "Kötü R:R olan sinyaller elenir.\n\n"
-
-            "/durum\n"
-            "/tara\n"
-            "/yardim"
-        )
-
-    except Exception as e:
-
-        print(
-            f"Telegram baslangic hatasi: {e}",
-            flush=True
-        )
+    telegram(
+        "🟢 Coin Radar V5 BAŞLADI\n\n"
+        "⭐ Minimum skor: 80\n"
+        "📊 15m + 1h teknik analiz\n"
+        "📰 Çoklu haber takibi\n"
+        "⚡ Breakout / Retest\n"
+        "🎯 Dinamik TP / SL\n"
+        "💵 Min Futures hacim: $10M\n\n"
+        "Otomatik Binance emri KAPALI."
+    )
 
     radar_thread = threading.Thread(
         target=radar_loop,
